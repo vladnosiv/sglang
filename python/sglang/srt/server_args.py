@@ -3371,7 +3371,6 @@ class ServerArgs:
                 "aibrix",
                 "dynamic",
                 "eic",
-                "memcache",
             ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
