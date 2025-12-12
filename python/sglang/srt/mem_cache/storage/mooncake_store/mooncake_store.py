@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -320,6 +321,87 @@ class MooncakeStore(HiCacheStorage):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
+    def register_mem_pool_device(self, mem_pool_device: KVCache):
+        super().register_mem_pool_device(mem_pool_device)
+        # Register device buffers for RDMA access
+        # Similar to host buffer registration, but for device memory
+        try:
+            if (
+                hasattr(mem_pool_device, "kv_buffer")
+                and mem_pool_device.kv_buffer is not None
+            ):
+                # For non-MLA models, register the combined kv_buffer
+                buffer = mem_pool_device.kv_buffer
+                buffer_ptr = buffer.data_ptr()
+                buffer_size = buffer.numel() * buffer.element_size()
+                ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
+                if ret_code:
+                    logger.error(
+                        f"Failed to register device kv_buffer, error code: {ret_code}"
+                    )
+                    raise RuntimeError(
+                        f"Failed to register device kv_buffer to Mooncake Store, error code: {ret_code}"
+                    )
+            else:
+                # For MLA models, register k_buffer, v_buffer, and optionally index_k_buffer
+                if (
+                    hasattr(mem_pool_device, "k_buffer")
+                    and mem_pool_device.k_buffer is not None
+                ):
+                    k_buffer = mem_pool_device.k_buffer
+                    ret_code = self.store.register_buffer(
+                        k_buffer.data_ptr(),
+                        k_buffer.numel() * k_buffer.element_size(),
+                    )
+                    if ret_code:
+                        logger.error(
+                            f"Failed to register device k_buffer, error code: {ret_code}"
+                        )
+                        raise RuntimeError(
+                            f"Failed to register device k_buffer to Mooncake Store, error code: {ret_code}"
+                        )
+
+                if (
+                    hasattr(mem_pool_device, "v_buffer")
+                    and mem_pool_device.v_buffer is not None
+                ):
+                    v_buffer = mem_pool_device.v_buffer
+                    ret_code = self.store.register_buffer(
+                        v_buffer.data_ptr(),
+                        v_buffer.numel() * v_buffer.element_size(),
+                    )
+                    if ret_code:
+                        logger.error(
+                            f"Failed to register device v_buffer, error code: {ret_code}"
+                        )
+                        raise RuntimeError(
+                            f"Failed to register device v_buffer to Mooncake Store, error code: {ret_code}"
+                        )
+
+                if (
+                    hasattr(mem_pool_device, "index_k_buffer")
+                    and mem_pool_device.index_k_buffer is not None
+                ):
+                    index_k_buffer = mem_pool_device.index_k_buffer
+                    ret_code = self.store.register_buffer(
+                        index_k_buffer.data_ptr(),
+                        index_k_buffer.numel() * index_k_buffer.element_size(),
+                    )
+                    if ret_code:
+                        logger.error(
+                            f"Failed to register device index_k_buffer, error code: {ret_code}"
+                        )
+                        raise RuntimeError(
+                            f"Failed to register device index_k_buffer to Mooncake Store, error code: {ret_code}"
+                        )
+
+            logger.info("Device memory buffers registered for Mooncake direct mode")
+        except (AttributeError, TypeError) as err:
+            logger.error("Failed to register device buffers to Mooncake Store: %s", err)
+            raise RuntimeError(
+                f"Mooncake Store Device Buffer Registration Error: {err}"
+            ) from err
+
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
@@ -444,7 +526,7 @@ class MooncakeStore(HiCacheStorage):
         values: Optional[List[torch.Tensor]] = None,
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-    ) -> bool:
+    ) -> bool | int:
         # Only support zero copy set for now
         assert target_locations is not None and target_sizes is not None
         assert len(keys) == len(target_locations) == len(target_sizes)
@@ -484,8 +566,8 @@ class MooncakeStore(HiCacheStorage):
             if exist_result[i] == 0:
                 break
             success_count += 1
-        # TODO: return the number of consecutive successful operations from the start.
-        return success_count == len(keys)
+        # Return the number of consecutive successful operations from the start.
+        return success_count
 
     def get(
         self,
