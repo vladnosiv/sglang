@@ -326,74 +326,16 @@ class MooncakeStore(HiCacheStorage):
         # Register device buffers for RDMA access
         # Similar to host buffer registration, but for device memory
         try:
-            if (
-                hasattr(mem_pool_device, "kv_buffer")
-                and mem_pool_device.kv_buffer is not None
-            ):
-                # For non-MLA models, register the combined kv_buffer
-                buffer = mem_pool_device.kv_buffer
-                buffer_ptr = buffer.data_ptr()
-                buffer_size = buffer.numel() * buffer.element_size()
-                ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                mem_pool_device.get_contiguous_buf_infos()
+            )
+            for ptr, len, _ in zip(kv_data_ptrs, kv_data_lens, kv_item_lens):
+                ret_code = self.store.register_buffer(ptr, len)
                 if ret_code:
-                    logger.error(
-                        f"Failed to register device kv_buffer, error code: {ret_code}"
-                    )
+                    logger.error(f"Failed to register buffer, error code: {ret_code}")
                     raise RuntimeError(
-                        f"Failed to register device kv_buffer to Mooncake Store, error code: {ret_code}"
+                        f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
                     )
-            else:
-                # For MLA models, register k_buffer, v_buffer, and optionally index_k_buffer
-                if (
-                    hasattr(mem_pool_device, "k_buffer")
-                    and mem_pool_device.k_buffer is not None
-                ):
-                    k_buffer = mem_pool_device.k_buffer
-                    ret_code = self.store.register_buffer(
-                        k_buffer.data_ptr(),
-                        k_buffer.numel() * k_buffer.element_size(),
-                    )
-                    if ret_code:
-                        logger.error(
-                            f"Failed to register device k_buffer, error code: {ret_code}"
-                        )
-                        raise RuntimeError(
-                            f"Failed to register device k_buffer to Mooncake Store, error code: {ret_code}"
-                        )
-
-                if (
-                    hasattr(mem_pool_device, "v_buffer")
-                    and mem_pool_device.v_buffer is not None
-                ):
-                    v_buffer = mem_pool_device.v_buffer
-                    ret_code = self.store.register_buffer(
-                        v_buffer.data_ptr(),
-                        v_buffer.numel() * v_buffer.element_size(),
-                    )
-                    if ret_code:
-                        logger.error(
-                            f"Failed to register device v_buffer, error code: {ret_code}"
-                        )
-                        raise RuntimeError(
-                            f"Failed to register device v_buffer to Mooncake Store, error code: {ret_code}"
-                        )
-
-                if (
-                    hasattr(mem_pool_device, "index_k_buffer")
-                    and mem_pool_device.index_k_buffer is not None
-                ):
-                    index_k_buffer = mem_pool_device.index_k_buffer
-                    ret_code = self.store.register_buffer(
-                        index_k_buffer.data_ptr(),
-                        index_k_buffer.numel() * index_k_buffer.element_size(),
-                    )
-                    if ret_code:
-                        logger.error(
-                            f"Failed to register device index_k_buffer, error code: {ret_code}"
-                        )
-                        raise RuntimeError(
-                            f"Failed to register device index_k_buffer to Mooncake Store, error code: {ret_code}"
-                        )
 
             logger.info("Device memory buffers registered for Mooncake direct mode")
         except (AttributeError, TypeError) as err:
@@ -520,19 +462,112 @@ class MooncakeStore(HiCacheStorage):
         )
         return put_result[0] == 0
 
+    def _apply_extra_backend_tag(self, keys: List[str]) -> List[str]:
+        if self.extra_backend_tag is None:
+            return keys
+        prefix = self.extra_backend_tag
+        return [f"{prefix}_{key}" for key in keys]
+
+    def _is_scatter_gather_locations(self, target_locations: Any) -> bool:
+        # direct-controller passes List[List[int]] (pages x buffers)
+        return (
+            isinstance(target_locations, list)
+            and len(target_locations) > 0
+            and isinstance(target_locations[0], list)
+        )
+
+    def _explode_scatter_gather(
+        self,
+        keys: List[str],
+        target_locations: List[List[int]],
+        target_sizes: List[List[int]],
+    ) -> tuple[List[str], List[int], List[int], int]:
+        assert len(keys) == len(target_locations) == len(target_sizes)
+        if len(keys) == 0:
+            return [], [], [], 0
+
+        num_bufs = len(target_locations[0])
+        for i in range(len(keys)):
+            assert len(target_locations[i]) == num_bufs
+            assert len(target_sizes[i]) == num_bufs
+
+        # Always include tp rank in key to avoid collisions across TP workers.
+        # buf_idx corresponds to the contiguous buffer index returned by
+        # KVCache.get_contiguous_buf_infos() (MHA: 2*layers, MLA: layers).
+        flat_keys: List[str] = []
+        flat_ptrs: List[int] = []
+        flat_sizes: List[int] = []
+        for page_idx, base_key in enumerate(keys):
+            for buf_idx in range(num_bufs):
+                flat_keys.append(f"{base_key}_{self.local_rank}_b{buf_idx}")
+                flat_ptrs.append(int(target_locations[page_idx][buf_idx]))
+                flat_sizes.append(int(target_sizes[page_idx][buf_idx]))
+
+        return flat_keys, flat_ptrs, flat_sizes, num_bufs
+
+    def _count_consecutive_full_pages(self, ok_flags: List[bool], num_bufs: int) -> int:
+        if num_bufs <= 0:
+            return 0
+        assert len(ok_flags) % num_bufs == 0
+        pages = len(ok_flags) // num_bufs
+        for p in range(pages):
+            start = p * num_bufs
+            end = start + num_bufs
+            if not all(ok_flags[start:end]):
+                return p
+        return pages
+
     def batch_set(
         self,
         keys: List[str],
         values: Optional[List[torch.Tensor]] = None,
-        target_locations: Optional[List[int]] = None,
-        target_sizes: Optional[List[int]] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> bool | int:
         # Only support zero copy set for now
         assert target_locations is not None and target_sizes is not None
-        assert len(keys) == len(target_locations) == len(target_sizes)
 
         if len(keys) == 0:
             return False
+
+        # Apply extra_backend_tag prefix if available
+        keys = self._apply_extra_backend_tag(keys)
+
+        # direct-controller path: scatter/gather pointers per page
+        if self._is_scatter_gather_locations(target_locations):
+            assert isinstance(target_locations, list) and isinstance(target_sizes, list)
+            flat_keys, flat_ptrs, flat_sizes, num_bufs = self._explode_scatter_gather(
+                keys, target_locations, target_sizes
+            )
+            if not flat_keys:
+                return 0
+
+            exist_result = self._batch_exist(flat_keys)
+
+            set_keys: List[str] = []
+            set_ptrs: List[int] = []
+            set_sizes: List[int] = []
+            set_indices: List[int] = []
+            for i in range(len(flat_keys)):
+                if exist_result[i] != 1:
+                    set_keys.append(flat_keys[i])
+                    set_ptrs.append(flat_ptrs[i])
+                    set_sizes.append(flat_sizes[i])
+                    set_indices.append(i)
+
+            if len(set_keys) > 0:
+                put_result = self._put_batch_zero_copy_impl(
+                    set_keys, set_ptrs, set_sizes
+                )
+                for j, flat_i in enumerate(set_indices):
+                    if put_result[j] == 0:
+                        exist_result[flat_i] = 1
+
+            ok_flags = [x == 1 for x in exist_result]
+            return self._count_consecutive_full_pages(ok_flags, num_bufs)
+
+        # legacy path: one key -> one ptr/size
+        assert len(keys) == len(target_locations) == len(target_sizes)
 
         for i in range(len(keys)):
             if (
@@ -587,16 +622,35 @@ class MooncakeStore(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
-        assert len(keys) == len(target_locations) == len(target_sizes)
+        assert target_locations is not None and target_sizes is not None
         if len(keys) == 0:
             return 0
+
+        # Apply extra_backend_tag prefix if available
+        keys = self._apply_extra_backend_tag(keys)
+
+        # direct-controller path: scatter/gather pointers per page
+        if self._is_scatter_gather_locations(target_locations):
+            assert isinstance(target_locations, list) and isinstance(target_sizes, list)
+            flat_keys, flat_ptrs, flat_sizes, num_bufs = self._explode_scatter_gather(
+                keys, target_locations, target_sizes
+            )
+            if not flat_keys:
+                return 0
+
+            get_result = self._get_batch_zero_copy_impl(
+                flat_keys, flat_ptrs, flat_sizes
+            )
+            ok_flags = [r >= 0 for r in get_result]
+            return self._count_consecutive_full_pages(ok_flags, num_bufs)
+
+        # legacy path: one key -> one ptr/size
+        assert len(keys) == len(target_locations) == len(target_sizes)
         get_result = self._get_batch_zero_copy_impl(
             keys, target_locations, target_sizes
         )
-        if self.is_mla_backend:
-            key_multiplier = 1
-        else:
-            key_multiplier = 2
+        # legacy semantics: MHA stores k/v as two keys per page
+        key_multiplier = 1 if self.is_mla_backend else 2
         for i in range(len(keys)):
             if get_result[i] < 0:
                 return i // key_multiplier
@@ -609,6 +663,36 @@ class MooncakeStore(HiCacheStorage):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if not keys:
+            return 0
+
+        # Apply extra_backend_tag prefix if available
+        keys = self._apply_extra_backend_tag(keys)
+
+        # direct-controller uses one key per page, but each page maps to multiple buffers.
+        # We cannot infer num_bufs from keys alone, so we conservatively fall back to the
+        # legacy behavior when called from v1 paths. For direct-controller, batch_exists
+        # is called with page keys and expects "pages hit" semantics; we implement that
+        # by probing buffer indices until the first miss.
+        #
+        # We use the registered device mem pool to infer number of buffers.
+        if self.mem_pool_device is not None:
+            kv_data_ptrs, _, _ = self.mem_pool_device.get_contiguous_buf_infos()
+            num_bufs = len(kv_data_ptrs)
+        else:
+            num_bufs = 0
+
+        if num_bufs > 0:
+            query_keys: List[str] = []
+            for key in keys:
+                for buf_idx in range(num_bufs):
+                    query_keys.append(f"{key}_{self.local_rank}_b{buf_idx}")
+
+            exist_result = self._batch_exist(query_keys)
+            ok_flags = [x == 1 for x in exist_result]
+            return self._count_consecutive_full_pages(ok_flags, num_bufs)
+
+        # Fallback: legacy v1 semantics (k/v keys)
         if self.is_mla_backend:
             query_keys = [f"{key}_k" for key in keys]
             key_multiplier = 1
@@ -636,6 +720,8 @@ class MooncakeStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
+        # сейчас сюда приходят keys по числу страниц, а buffer_ptrs len(keys_strs),
+        # но внутри у каждого ключа лежат 2 * Layers элементов, нужно учитывать при записи
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
