@@ -79,6 +79,15 @@ class HiCacheStorage(ABC):
     def register_mem_pool_device(self, mem_pool_device: KVCache):
         self.mem_pool_device = mem_pool_device
 
+    def register_device_buffer(self, ptr: int, size: int) -> None:
+        """
+        Optionally register an additional device buffer for zero-copy / RDMA access.
+
+        Default implementation is a no-op. Backends that require explicit registration
+        (e.g. Mooncake) can override this.
+        """
+        return
+
     def batch_get_v1(
         self,
         keys: List[str],

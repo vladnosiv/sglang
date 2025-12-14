@@ -1,5 +1,6 @@
 import logging
-from queue import Empty
+import time
+from queue import Empty, Full, Queue
 from typing import List, Optional
 
 import torch
@@ -62,6 +63,9 @@ class LoadStorageOperation:
 
 
 class HiCacheControllerDirect:
+    # Fire-and-forget async STORE queue size (per process).
+    # If full, STORE is dropped (logged) to avoid blocking decode.
+    ASYNC_STORE_QUEUE_MAXSIZE = 1024
 
     def __init__(
         self,
@@ -70,6 +74,7 @@ class HiCacheControllerDirect:
         tp_group: torch.distributed.ProcessGroup,
         storage_backend: str,
         device_id: int = 0,
+        model_name: Optional[str] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -97,15 +102,41 @@ class HiCacheControllerDirect:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
+        # MVP: only MHA is supported for packed page-first mode.
+        # MLA keeps using the existing scatter/gather path.
+        self.use_packed_page_first = not self.is_mla_model
+
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = self.is_mla_model and self.tp_rank != 0
+
+        self.model_name = model_name
+        # Namespace keys by model + KV geometry to avoid collisions across different models/configs.
+        # This is critical for Mooncake because it enforces fixed value size per key.
+        dtype_name = str(
+            getattr(self.mem_pool_device, "dtype", None)
+            or getattr(self.mem_pool_device, "store_dtype", "")
+        )
+        if self.use_packed_page_first:
+            head_num = int(self.mem_pool_device.head_num)
+            head_dim = int(self.mem_pool_device.head_dim)
+        else:
+            head_num = -1
+            head_dim = -1
+        self.key_namespace = (
+            f"{self.model_name or 'default'}"
+            f"_ps{self.page_size}"
+            f"_L{int(self.mem_pool_device.layer_num)}"
+            f"_H{head_num}"
+            f"_D{head_dim}"
+            f"_dt{dtype_name}"
+        )
 
         self.storage_config = HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=self.is_mla_model,
-            is_page_first_layout=False,
-            model_name=None,
+            is_page_first_layout=self.use_packed_page_first,
+            model_name=self.model_name,
             extra_config={"device_id": device_id},
         )
         try:
@@ -121,6 +152,36 @@ class HiCacheControllerDirect:
         # granularity of batch storage IO operations, in number of pages
         self.storage_batch_size = 256
 
+        # Packed page-first scratch buffer (MHA only).
+        # Mooncake transfer engine may reject registering overlapping regions; therefore we
+        # register one fixed scratch buffer once and reuse it for all operations.
+        self._packed_scratch = None
+        if self.use_packed_page_first:
+            head_num = int(self.mem_pool_device.head_num)
+            head_dim = int(self.mem_pool_device.head_dim)
+            layer_num = int(self.mem_pool_device.layer_num)
+            dtype = self.mem_pool_device.store_dtype
+            self._packed_scratch = torch.empty(
+                (
+                    2,
+                    self.storage_batch_size,
+                    layer_num,
+                    self.page_size,
+                    head_num,
+                    head_dim,
+                ),
+                dtype=dtype,
+                device=self.device,
+            )
+            self.storage_backend.register_device_buffer(
+                self._packed_scratch.data_ptr(), self._packed_scratch.nbytes
+            )
+            scratch_gib = self._packed_scratch.nbytes / (1024**3)
+            logger.info(
+                "hicache_direct packed scratch allocated: %.3f GiB (NOT counted in --mem-fraction-static sizing; reduces dynamic headroom)",
+                scratch_gib,
+            )
+
         # create a new communication group for synchronizing storage operations across TP workers
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
         if self.tp_world_size > 1:
@@ -135,25 +196,94 @@ class HiCacheControllerDirect:
 
         self.load_queue: List[LoadStorageOperation] = []
 
+        # Async STORE (fire-and-forget)
+        self._store_queue: Queue = Queue(maxsize=self.ASYNC_STORE_QUEUE_MAXSIZE)
+        self._store_thread = None
+        self._store_stop = False
+        # NOTE: avoid importing threading at module import time; do it lazily
+        import threading  # local import
+
+        self._store_thread = threading.Thread(
+            target=self._store_thread_func, daemon=True
+        )
+        self._store_thread.start()
+
     def reset(self):
         self.load_queue.clear()
 
+    def close(self):
+        # Best-effort stop; do not block shutdown.
+        self._store_stop = True
+        try:
+            if self._store_thread is not None:
+                self._store_thread.join(timeout=0.1)
+        except Exception:
+            pass
+
     def write(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
+        """
+        Fire-and-forget STORE:
+        - enqueue a copy of device_indices (to keep it alive) and hash_keys
+        - return immediately (does not block decode)
+        """
         if self.backup_skip:
             return 0
 
+        # Keep a private copy of indices so caller can free/reuse its tensor safely.
+        # (This is extra GPU memory, but bounded by queue size.)
         try:
-            succ_pages_num = self._memcpy_between_device_and_storage(
-                hash_keys, device_indices, "write"
+            indices_copy = device_indices.to(
+                device_indices.device, dtype=device_indices.dtype, copy=True
             )
-            if self.tp_world_size > 1 and self.is_mla_model is False:
-                # only mha model need all reduce
-                succ_pages_num = self._allreduce_results(succ_pages_num)
+        except Exception:
+            # If copy fails, fall back to synchronous write (best-effort)
+            try:
+                succ_pages_num = self._memcpy_between_device_and_storage(
+                    hash_keys, device_indices, "write"
+                )
+                if self.tp_world_size > 1 and self.is_mla_model is False:
+                    succ_pages_num = self._allreduce_results(succ_pages_num)
+                logger.debug(f"success write {succ_pages_num} pages (sync fallback)")
+                return succ_pages_num * self.page_size
+            except Exception:
+                return 0
 
-            logger.debug(f"success write {succ_pages_num} pages")
-            return succ_pages_num * self.page_size
-        except Empty:
+        try:
+            self._store_queue.put_nowait((list(hash_keys), indices_copy))
+            return len(hash_keys) * self.page_size
+        except Full:
+            logger.warning(
+                "hicache_direct STORE dropped: async queue full (maxsize=%d), pages=%d",
+                self.ASYNC_STORE_QUEUE_MAXSIZE,
+                len(hash_keys),
+            )
             return 0
+
+    def _store_thread_func(self):
+        while not self._store_stop:
+            try:
+                item = self._store_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                hash_keys, device_indices = item
+                succ_pages_num = self._memcpy_between_device_and_storage(
+                    hash_keys, device_indices, "write"
+                )
+                if self.tp_world_size > 1 and self.is_mla_model is False:
+                    succ_pages_num = self._allreduce_results(succ_pages_num)
+                logger.debug(
+                    "hicache_direct async STORE done: succ_pages=%d/%d",
+                    succ_pages_num,
+                    len(hash_keys),
+                )
+            except Exception as e:
+                logger.exception("hicache_direct async STORE failed: %s", e)
+            finally:
+                try:
+                    self._store_queue.task_done()
+                except Exception:
+                    pass
 
     def load(
         self,
@@ -231,16 +361,54 @@ class HiCacheControllerDirect:
         if not operation.hash_keys:
             return 0
 
+        # Debug: help diagnose partial hits across restarts
+        try:
+            hk = operation.hash_keys
+            logger.info(
+                "hicache_direct hit_query: rid=%s tp=%s pages=%s last_hash=%s hk0=%s hk1=%s hk_last2=%s hk_last1=%s",
+                operation.request_id,
+                self.tp_rank,
+                len(hk),
+                operation.last_hash,
+                hk[0] if len(hk) > 0 else None,
+                hk[1] if len(hk) > 1 else None,
+                hk[-2] if len(hk) > 1 else None,
+                hk[-1] if len(hk) > 0 else None,
+            )
+            if self.use_packed_page_first and len(hk) > 0:
+                logger.info(
+                    "hicache_direct hit_query probe example: %s",
+                    f"{hk[0]}_{self.tp_rank}_k",
+                )
+        except Exception:
+            pass
+
         total_len = len(operation.hash_keys)
         total_hit_num = 0
         for start in range(0, total_len, self.storage_batch_size):
             end = min(start + self.storage_batch_size, total_len)
             batch_hashes = operation.hash_keys[start:end]
-            hit_num = self.storage_backend.batch_exists(batch_hashes)
+
+            if self.use_packed_page_first:
+                # Packed mode stores 2 keys per page: {key}_{tp}_k and {key}_{tp}_v.
+                # For hit probing we only check the K keys (assume V exists if K exists).
+                probe_keys = [
+                    f"{self.key_namespace}_{k}_{self.tp_rank}_k" for k in batch_hashes
+                ]
+                hit_num = self.storage_backend.batch_exists(probe_keys)
+            else:
+                hit_num = self.storage_backend.batch_exists(batch_hashes)
+
             total_hit_num += hit_num
             if hit_num < len(batch_hashes):
                 break
 
+        logger.info(
+            "hicache_direct hit_query result: rid=%s hit_pages=%s/%s",
+            operation.request_id,
+            total_hit_num,
+            total_len,
+        )
         return total_hit_num
 
     def _memcpy_between_device_and_storage(
@@ -250,6 +418,9 @@ class HiCacheControllerDirect:
         direction: str,
     ) -> int:
         assert hash_keys
+
+        if self.use_packed_page_first:
+            return self._memcpy_packed_page_first(hash_keys, device_indices, direction)
 
         batch_memcpy = None
         if direction == "write":
@@ -278,6 +449,169 @@ class HiCacheControllerDirect:
                 break
 
         return total_succ_num
+
+    def _memcpy_packed_page_first(
+        self,
+        hash_keys: List[str],
+        device_indices: torch.Tensor,
+        direction: str,
+    ) -> int:
+        """
+        Packed page-first mode (MHA only):
+        - pack device KVCache pages into contiguous (K,V) buffers on GPU
+        - store/load 2 keys per page: {hash}_{tp}_k and {hash}_{tp}_v
+        """
+        assert not self.is_mla_model, "Packed page-first mode is MHA-only in MVP"
+        assert hasattr(self.mem_pool_device, "head_num") and hasattr(
+            self.mem_pool_device, "head_dim"
+        ), "Packed page-first mode expects MHA KVCache"
+
+        if direction == "write":
+            batch_memcpy = self.storage_backend.batch_set
+        elif direction == "load":
+            batch_memcpy = self.storage_backend.batch_get
+        else:
+            raise ValueError(f"Unsupported direction: {direction}")
+
+        token_len = int(device_indices.shape[0])
+        assert token_len % self.page_size == 0
+        num_pages = token_len // self.page_size
+
+        # Build page->token indices [num_pages, page_size]
+        page_token_idx = device_indices.view(num_pages, self.page_size)
+
+        # [num_pages, layer_num, page_size, head_num, head_dim]
+        head_num = int(self.mem_pool_device.head_num)
+        head_dim = int(self.mem_pool_device.head_dim)
+        layer_num = int(self.mem_pool_device.layer_num)
+
+        # Prepare 2 keys per page and pointers/sizes using a pre-registered scratch buffer.
+        total_elements = len(hash_keys)
+        assert total_elements == num_pages
+        assert (
+            self._packed_scratch is not None
+        ), "Packed scratch buffer must be initialized"
+
+        pack_ms_total = 0.0
+        io_ms_total = 0.0
+        unpack_ms_total = 0.0
+        pages_total = 0
+        total_succ_pages = 0
+
+        t_op0 = time.perf_counter()
+        for start in range(0, total_elements, self.storage_batch_size):
+            end = min(start + self.storage_batch_size, total_elements)
+            batch_hashes = hash_keys[start:end]
+            batch_pages = end - start
+            pages_total += batch_pages
+
+            # Views into pre-registered scratch buffer
+            packed_k = self._packed_scratch[0, :batch_pages]
+            packed_v = self._packed_scratch[1, :batch_pages]
+
+            batch_token_idx = page_token_idx[start:end]
+            flat_idx = batch_token_idx.reshape(-1)
+
+            t_pack0 = time.perf_counter()
+            if direction == "write":
+                for layer_id in range(layer_num):
+                    k_layer = self.mem_pool_device._get_key_buffer(layer_id)
+                    v_layer = self.mem_pool_device._get_value_buffer(layer_id)
+                    packed_k[:, layer_id] = k_layer.index_select(0, flat_idx).view(
+                        batch_pages, self.page_size, head_num, head_dim
+                    )
+                    packed_v[:, layer_id] = v_layer.index_select(0, flat_idx).view(
+                        batch_pages, self.page_size, head_num, head_dim
+                    )
+            t_pack1 = time.perf_counter()
+            pack_ms_total += (t_pack1 - t_pack0) * 1000.0
+
+            keys_kv: List[str] = []
+            ptrs: List[int] = []
+            sizes: List[int] = []
+            for local_page_i, base_key in enumerate(batch_hashes):
+                namespaced = f"{self.key_namespace}_{base_key}"
+                keys_kv.append(f"{namespaced}_{self.tp_rank}_k")
+                keys_kv.append(f"{namespaced}_{self.tp_rank}_v")
+
+                k_page = packed_k[local_page_i]
+                v_page = packed_v[local_page_i]
+                ptrs.append(int(k_page.data_ptr()))
+                ptrs.append(int(v_page.data_ptr()))
+                sizes.append(int(k_page.nbytes))
+                sizes.append(int(v_page.nbytes))
+
+            t_io0 = time.perf_counter()
+            succ_raw = batch_memcpy(
+                keys=keys_kv, target_locations=ptrs, target_sizes=sizes
+            )
+            t_io1 = time.perf_counter()
+            io_ms_total += (t_io1 - t_io0) * 1000.0
+
+            if isinstance(succ_raw, bool):
+                succ_keys = len(keys_kv) if succ_raw else 0
+            elif isinstance(succ_raw, list):
+                succ_keys = 0
+                for r in succ_raw:
+                    ok = (
+                        (r == 0) if direction == "write" else (r is not None and r >= 0)
+                    )
+                    if not ok:
+                        break
+                    succ_keys += 1
+            else:
+                succ_keys = int(succ_raw)
+
+            # Mooncake legacy batch_get returns pages (k/v pairs), while batch_set returns keys.
+            # Normalize to "pages" here.
+            if direction == "load" and succ_keys <= batch_pages:
+                succ_pages = succ_keys
+            else:
+                succ_pages = succ_keys // 2
+            total_succ_pages += succ_pages
+
+            t_unpack0 = time.perf_counter()
+            if direction == "load" and succ_pages > 0:
+                loaded_flat_idx = batch_token_idx[:succ_pages].reshape(-1)
+                for layer_id in range(layer_num):
+                    k_layer = self.mem_pool_device._get_key_buffer(layer_id)
+                    v_layer = self.mem_pool_device._get_value_buffer(layer_id)
+                    k_layer.index_copy_(
+                        0,
+                        loaded_flat_idx,
+                        packed_k[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
+                    )
+                    v_layer.index_copy_(
+                        0,
+                        loaded_flat_idx,
+                        packed_v[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
+                    )
+            t_unpack1 = time.perf_counter()
+            unpack_ms_total += (t_unpack1 - t_unpack0) * 1000.0
+
+            if succ_pages < batch_pages:
+                break
+
+        t_op1 = time.perf_counter()
+        total_ms = (t_op1 - t_op0) * 1000.0
+        denom_pages = float(pages_total) if pages_total > 0 else 1.0
+
+        logger.info(
+            "hicache_direct %s timing: pages=%d succ_pages=%d pack=%.3fms (%.4fms/page) io=%.3fms (%.4fms/page) unpack=%.3fms (%.4fms/page) total=%.3fms (%.4fms/page)",
+            "STORE" if direction == "write" else "LOAD",
+            pages_total,
+            total_succ_pages,
+            pack_ms_total,
+            pack_ms_total / denom_pages,
+            io_ms_total,
+            io_ms_total / denom_pages,
+            unpack_ms_total,
+            unpack_ms_total / denom_pages,
+            total_ms,
+            total_ms / denom_pages,
+        )
+
+        return total_succ_pages
 
     def _parse_success_hashes_from_l3_results(
         self,

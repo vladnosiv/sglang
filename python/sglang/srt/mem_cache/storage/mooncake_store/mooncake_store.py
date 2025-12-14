@@ -330,12 +330,7 @@ class MooncakeStore(HiCacheStorage):
                 mem_pool_device.get_contiguous_buf_infos()
             )
             for ptr, len, _ in zip(kv_data_ptrs, kv_data_lens, kv_item_lens):
-                ret_code = self.store.register_buffer(ptr, len)
-                if ret_code:
-                    logger.error(f"Failed to register buffer, error code: {ret_code}")
-                    raise RuntimeError(
-                        f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                    )
+                self.register_device_buffer(ptr, len)
 
             logger.info("Device memory buffers registered for Mooncake direct mode")
         except (AttributeError, TypeError) as err:
@@ -343,6 +338,14 @@ class MooncakeStore(HiCacheStorage):
             raise RuntimeError(
                 f"Mooncake Store Device Buffer Registration Error: {err}"
             ) from err
+
+    def register_device_buffer(self, ptr: int, size: int) -> None:
+        ret_code = self.store.register_buffer(int(ptr), int(size))
+        if ret_code:
+            logger.error(f"Failed to register buffer, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+            )
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
@@ -669,13 +672,29 @@ class MooncakeStore(HiCacheStorage):
         # Apply extra_backend_tag prefix if available
         keys = self._apply_extra_backend_tag(keys)
 
-        # direct-controller uses one key per page, but each page maps to multiple buffers.
-        # We cannot infer num_bufs from keys alone, so we conservatively fall back to the
-        # legacy behavior when called from v1 paths. For direct-controller, batch_exists
-        # is called with page keys and expects "pages hit" semantics; we implement that
-        # by probing buffer indices until the first miss.
-        #
-        # We use the registered device mem pool to infer number of buffers.
+        # If caller already provides explicit KV keys (packed/legacy mode),
+        # do NOT expand into b{buf} keys. Just check as-is.
+        # Examples:
+        # - MHA packed/legacy: "{hash}_{tp}_k" / "{hash}_{tp}_v"
+        # - MLA legacy: "{hash}_k"
+        if any(
+            isinstance(k, str)
+            and (
+                k.endswith("_k")
+                or k.endswith("_v")
+                or f"_{self.local_rank}_k" in k
+                or f"_{self.local_rank}_v" in k
+            )
+            for k in keys
+        ):
+            exist_result = self._batch_exist(keys)
+            for i, r in enumerate(exist_result):
+                if r != 1:
+                    return i
+            return len(keys)
+
+        # direct-controller scatter/gather mode: one key per page, but each page maps to multiple buffers.
+        # Implement "pages hit" semantics by probing buffer indices until the first miss.
         if self.mem_pool_device is not None:
             kv_data_ptrs, _, _ = self.mem_pool_device.get_contiguous_buf_infos()
             num_bufs = len(kv_data_ptrs)
@@ -692,7 +711,7 @@ class MooncakeStore(HiCacheStorage):
             ok_flags = [x == 1 for x in exist_result]
             return self._count_consecutive_full_pages(ok_flags, num_bufs)
 
-        # Fallback: legacy v1 semantics (k/v keys)
+        # Fallback: legacy v1 semantics (page keys -> k/v keys)
         if self.is_mla_backend:
             query_keys = [f"{key}_k" for key in keys]
             key_multiplier = 1

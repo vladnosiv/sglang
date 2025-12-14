@@ -34,6 +34,7 @@ class HiRadixCacheDirect(RadixCache):
             params.tp_cache_group,
             storage_backend=server_args.hicache_storage_backend,
             device_id=params.gpu_id,
+            model_name=server_args.served_model_name,
         )
         if self.enable_storage_metrics:
             labels = {
@@ -186,8 +187,11 @@ class HiRadixCacheDirect(RadixCache):
 
         remainder = new_input_len % self.page_size
         if remainder == 0:
-            # to avoid input tokens length = 0 while hit the entire input tokens
-            new_input_tokens = new_input_tokens[: (new_input_len - self.page_size)]
+            # If the tail is exactly one page, there is no benefit to load (would be too small / unstable).
+            # Otherwise, keep the full page-aligned tail (do NOT drop the last page).
+            if new_input_len == self.page_size:
+                return None, req.last_node
+            # keep as-is (already page-aligned)
         else:
             new_input_tokens = new_input_tokens[: (new_input_len - remainder)]
 
