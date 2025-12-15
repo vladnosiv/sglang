@@ -70,6 +70,9 @@ class _AsyncStoreTask:
     sizes: List[int]
     # (start_page, num_pages) slice in the IO buffer to free after IO completes
     io_slice: Tuple[int, int]
+    # timing / debug
+    enqueue_ts: float
+    pack_ms: float
 
 
 class HiCacheControllerDirect:
@@ -261,8 +264,7 @@ class HiCacheControllerDirect:
     def write(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
         """
         Async STORE (MHA packed page-first):
-        - pack sync into pre-registered scratch
-        - copy sync into a slice of a pre-registered IO buffer
+        - pack sync directly into a slice of a pre-registered IO buffer
         - enqueue IO-only task (batch_set) to background thread
         """
         if self.backup_skip:
@@ -292,17 +294,25 @@ class HiCacheControllerDirect:
         io_slice = self._async_store_io_alloc(num_pages)
         if io_slice is None:
             self._async_store_io_drop_pages += num_pages
+            with self._async_store_io_lock:
+                free_pages = sum(l for _, l in self._async_store_io_free)
+                inflight_pages = self._async_store_io_inflight_pages
+                cap_pages = self._async_store_io_capacity_pages
             logger.warning(
-                "hicache_direct STORE dropped: async IO buffer full, pages=%d (dropped_total_pages=%d)",
+                "hicache_direct STORE dropped: async IO buffer full, pages=%d dropped_total_pages=%d inflight_pages=%d free_pages=%d cap_pages=%d",
                 num_pages,
                 self._async_store_io_drop_pages,
+                inflight_pages,
+                free_pages,
+                cap_pages,
             )
             return 0
 
         start_page, slice_pages = io_slice
         assert slice_pages == num_pages
 
-        # Pack into scratch and copy into IO buffer slice
+        # Pack directly into IO buffer slice (sync)
+        t_pack0 = time.perf_counter()
         try:
             keys, ptrs, sizes = self._pack_pages_for_async_store(
                 hash_keys=hash_keys,
@@ -311,22 +321,37 @@ class HiCacheControllerDirect:
                 io_pages=slice_pages,
             )
         except Exception:
-            # On failure, free slice and drop
             self._async_store_io_free_slice(start_page, slice_pages)
             raise
+        t_pack1 = time.perf_counter()
+        pack_ms = (t_pack1 - t_pack0) * 1000.0
 
-        task = _AsyncStoreTask(keys=keys, ptrs=ptrs, sizes=sizes, io_slice=io_slice)
+        task = _AsyncStoreTask(
+            keys=keys,
+            ptrs=ptrs,
+            sizes=sizes,
+            io_slice=io_slice,
+            enqueue_ts=time.perf_counter(),
+            pack_ms=pack_ms,
+        )
         try:
             self._store_queue.put_nowait(task)
             return num_pages * self.page_size
         except Full:
             self._async_store_io_free_slice(start_page, slice_pages)
             self._async_store_io_drop_pages += num_pages
+            with self._async_store_io_lock:
+                free_pages = sum(l for _, l in self._async_store_io_free)
+                inflight_pages = self._async_store_io_inflight_pages
+                cap_pages = self._async_store_io_capacity_pages
             logger.warning(
-                "hicache_direct STORE dropped: async queue full (maxsize=%d), pages=%d (dropped_total_pages=%d)",
+                "hicache_direct STORE dropped: async queue full maxsize=%d pages=%d dropped_total_pages=%d inflight_pages=%d free_pages=%d cap_pages=%d",
                 self.ASYNC_STORE_QUEUE_MAXSIZE,
                 num_pages,
                 self._async_store_io_drop_pages,
+                inflight_pages,
+                free_pages,
+                cap_pages,
             )
             return 0
 
@@ -336,11 +361,17 @@ class HiCacheControllerDirect:
                 task: _AsyncStoreTask = self._store_queue.get(timeout=0.1)
             except Empty:
                 continue
+
+            t_io0 = time.perf_counter()
+            succ_pages = 0
             try:
                 # IO-only: batch_set from pre-registered IO buffer slice
                 succ_raw = self.storage_backend.batch_set(
                     keys=task.keys, target_locations=task.ptrs, target_sizes=task.sizes
                 )
+                t_io1 = time.perf_counter()
+                io_ms = (t_io1 - t_io0) * 1000.0
+
                 if isinstance(succ_raw, bool):
                     succ_keys = len(task.keys) if succ_raw else 0
                 elif isinstance(succ_raw, list):
@@ -356,10 +387,24 @@ class HiCacheControllerDirect:
                 if self.tp_world_size > 1 and self.is_mla_model is False:
                     succ_pages = self._allreduce_results(succ_pages)
 
-                logger.debug(
-                    "hicache_direct async STORE done: succ_pages=%d/%d",
-                    succ_pages,
+                e2e_ms = (time.perf_counter() - task.enqueue_ts) * 1000.0
+
+                with self._async_store_io_lock:
+                    free_pages = sum(l for _, l in self._async_store_io_free)
+                    inflight_pages = self._async_store_io_inflight_pages
+                    cap_pages = self._async_store_io_capacity_pages
+
+                logger.info(
+                    "hicache_direct async STORE timing: pages=%d succ_pages=%d pack=%.3fms io=%.3fms e2e=%.3fms inflight_pages=%d free_pages=%d cap_pages=%d dropped_total_pages=%d",
                     task.io_slice[1],
+                    succ_pages,
+                    task.pack_ms,
+                    io_ms,
+                    e2e_ms,
+                    inflight_pages,
+                    free_pages,
+                    cap_pages,
+                    self._async_store_io_drop_pages,
                 )
             except Exception as e:
                 logger.exception("hicache_direct async STORE failed: %s", e)
