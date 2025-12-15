@@ -165,35 +165,8 @@ class HiCacheControllerDirect:
         # granularity of batch storage IO operations, in number of pages
         self.storage_batch_size = 256
 
-        # Packed page-first scratch buffer (MHA only).
-        # Mooncake transfer engine may reject registering overlapping regions; therefore we
-        # register one fixed scratch buffer once and reuse it for all operations.
-        self._packed_scratch = None
-        if self.use_packed_page_first:
-            head_num = int(self.mem_pool_device.head_num)
-            head_dim = int(self.mem_pool_device.head_dim)
-            layer_num = int(self.mem_pool_device.layer_num)
-            dtype = self.mem_pool_device.store_dtype
-            self._packed_scratch = torch.empty(
-                (
-                    2,
-                    self.storage_batch_size,
-                    layer_num,
-                    self.page_size,
-                    head_num,
-                    head_dim,
-                ),
-                dtype=dtype,
-                device=self.device,
-            )
-            self.storage_backend.register_device_buffer(
-                self._packed_scratch.data_ptr(), self._packed_scratch.nbytes
-            )
-            scratch_gib = self._packed_scratch.nbytes / (1024**3)
-            logger.info(
-                "hicache_direct packed scratch allocated: %.3f GiB (NOT counted in --mem-fraction-static sizing; reduces dynamic headroom)",
-                scratch_gib,
-            )
+        # NOTE: We intentionally do NOT allocate a separate packed scratch buffer.
+        # Async STORE packs directly into a slice of the pre-registered IO buffer.
 
         # create a new communication group for synchronizing storage operations across TP workers
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
@@ -210,8 +183,7 @@ class HiCacheControllerDirect:
         self.load_queue: List[LoadStorageOperation] = []
 
         # Async STORE (IO-only in background):
-        # - pack happens synchronously into a pre-registered scratch buffer
-        # - then we copy packed data into a slice of a single pre-registered IO buffer
+        # - pack happens synchronously directly into a slice of a single pre-registered IO buffer
         # - background thread performs only batch_set() from that IO buffer slice
         self._store_queue: Queue = Queue(maxsize=self.ASYNC_STORE_QUEUE_MAXSIZE)
         self._store_thread = None
@@ -657,8 +629,8 @@ class HiCacheControllerDirect:
         total_elements = len(hash_keys)
         assert total_elements == num_pages
         assert (
-            self._packed_scratch is not None
-        ), "Packed scratch buffer must be initialized"
+            self._async_store_io_buf is not None
+        ), "Async STORE IO buffer must be initialized"
 
         pack_ms_total = 0.0
         io_ms_total = 0.0
@@ -673,9 +645,9 @@ class HiCacheControllerDirect:
             batch_pages = end - start
             pages_total += batch_pages
 
-            # Views into pre-registered scratch buffer
-            packed_k = self._packed_scratch[0, :batch_pages]
-            packed_v = self._packed_scratch[1, :batch_pages]
+            # Views into IO buffer (direct pack target)
+            io_k = self._async_store_io_buf[0, :batch_pages]
+            io_v = self._async_store_io_buf[1, :batch_pages]
 
             batch_token_idx = page_token_idx[start:end]
             flat_idx = batch_token_idx.reshape(-1)
@@ -685,10 +657,10 @@ class HiCacheControllerDirect:
                 for layer_id in range(layer_num):
                     k_layer = self.mem_pool_device._get_key_buffer(layer_id)
                     v_layer = self.mem_pool_device._get_value_buffer(layer_id)
-                    packed_k[:, layer_id] = k_layer.index_select(0, flat_idx).view(
+                    io_k[:, layer_id] = k_layer.index_select(0, flat_idx).view(
                         batch_pages, self.page_size, head_num, head_dim
                     )
-                    packed_v[:, layer_id] = v_layer.index_select(0, flat_idx).view(
+                    io_v[:, layer_id] = v_layer.index_select(0, flat_idx).view(
                         batch_pages, self.page_size, head_num, head_dim
                     )
             t_pack1 = time.perf_counter()
@@ -702,8 +674,8 @@ class HiCacheControllerDirect:
                 keys_kv.append(f"{namespaced}_{self.tp_rank}_k")
                 keys_kv.append(f"{namespaced}_{self.tp_rank}_v")
 
-                k_page = packed_k[local_page_i]
-                v_page = packed_v[local_page_i]
+                k_page = io_k[local_page_i]
+                v_page = io_v[local_page_i]
                 ptrs.append(int(k_page.data_ptr()))
                 ptrs.append(int(v_page.data_ptr()))
                 sizes.append(int(k_page.nbytes))
@@ -747,12 +719,12 @@ class HiCacheControllerDirect:
                     k_layer.index_copy_(
                         0,
                         loaded_flat_idx,
-                        packed_k[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
+                        io_k[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
                     )
                     v_layer.index_copy_(
                         0,
                         loaded_flat_idx,
-                        packed_v[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
+                        io_v[:succ_pages, layer_id].reshape(-1, head_num, head_dim),
                     )
             t_unpack1 = time.perf_counter()
             unpack_ms_total += (t_unpack1 - t_unpack0) * 1000.0
@@ -789,11 +761,9 @@ class HiCacheControllerDirect:
         io_pages: int,
     ) -> tuple[List[str], List[int], List[int]]:
         """
-        Pack pages into scratch, then copy into IO buffer slice, and return (keys, ptrs, sizes)
-        for batch_set().
+        Pack pages directly into IO buffer slice, and return (keys, ptrs, sizes) for batch_set().
         """
         assert self.use_packed_page_first
-        assert self._packed_scratch is not None
         assert self._async_store_io_buf is not None
         assert io_pages == len(hash_keys)
 
@@ -803,43 +773,34 @@ class HiCacheControllerDirect:
         assert num_pages == io_pages
 
         page_token_idx = device_indices.view(num_pages, self.page_size)
-        flat_idx = page_token_idx.reshape(-1)
 
         head_num = int(self.mem_pool_device.head_num)
         head_dim = int(self.mem_pool_device.head_dim)
         layer_num = int(self.mem_pool_device.layer_num)
 
-        # pack into scratch
-        # NOTE: _packed_scratch is sized by storage_batch_size, so io_pages can be > storage_batch_size.
-        # Pack in chunks to avoid shape mismatch.
+        # Pack directly into IO buffer slice (no extra scratch buffer).
         for chunk_start in range(0, io_pages, self.storage_batch_size):
             chunk_end = min(chunk_start + self.storage_batch_size, io_pages)
             chunk_pages = chunk_end - chunk_start
 
-            packed_k = self._packed_scratch[0, :chunk_pages]
-            packed_v = self._packed_scratch[1, :chunk_pages]
-
-            chunk_flat_idx = page_token_idx[chunk_start:chunk_end].reshape(-1)
-
-            for layer_id in range(layer_num):
-                k_layer = self.mem_pool_device._get_key_buffer(layer_id)
-                v_layer = self.mem_pool_device._get_value_buffer(layer_id)
-                packed_k[:, layer_id] = k_layer.index_select(0, chunk_flat_idx).view(
-                    chunk_pages, self.page_size, head_num, head_dim
-                )
-                packed_v[:, layer_id] = v_layer.index_select(0, chunk_flat_idx).view(
-                    chunk_pages, self.page_size, head_num, head_dim
-                )
-
-            # copy scratch -> IO buffer slice for this chunk
             io_k = self._async_store_io_buf[
                 0, io_start_page + chunk_start : io_start_page + chunk_end
             ]
             io_v = self._async_store_io_buf[
                 1, io_start_page + chunk_start : io_start_page + chunk_end
             ]
-            io_k.copy_(packed_k)
-            io_v.copy_(packed_v)
+
+            chunk_flat_idx = page_token_idx[chunk_start:chunk_end].reshape(-1)
+
+            for layer_id in range(layer_num):
+                k_layer = self.mem_pool_device._get_key_buffer(layer_id)
+                v_layer = self.mem_pool_device._get_value_buffer(layer_id)
+                io_k[:, layer_id] = k_layer.index_select(0, chunk_flat_idx).view(
+                    chunk_pages, self.page_size, head_num, head_dim
+                )
+                io_v[:, layer_id] = v_layer.index_select(0, chunk_flat_idx).view(
+                    chunk_pages, self.page_size, head_num, head_dim
+                )
 
         # build keys/ptrs/sizes (2 keys per page) from the IO buffer slice
         io_k_all = self._async_store_io_buf[0, io_start_page : io_start_page + io_pages]
