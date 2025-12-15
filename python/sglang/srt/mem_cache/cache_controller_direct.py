@@ -810,25 +810,41 @@ class HiCacheControllerDirect:
         layer_num = int(self.mem_pool_device.layer_num)
 
         # pack into scratch
-        packed_k = self._packed_scratch[0, :io_pages]
-        packed_v = self._packed_scratch[1, :io_pages]
-        for layer_id in range(layer_num):
-            k_layer = self.mem_pool_device._get_key_buffer(layer_id)
-            v_layer = self.mem_pool_device._get_value_buffer(layer_id)
-            packed_k[:, layer_id] = k_layer.index_select(0, flat_idx).view(
-                io_pages, self.page_size, head_num, head_dim
-            )
-            packed_v[:, layer_id] = v_layer.index_select(0, flat_idx).view(
-                io_pages, self.page_size, head_num, head_dim
-            )
+        # NOTE: _packed_scratch is sized by storage_batch_size, so io_pages can be > storage_batch_size.
+        # Pack in chunks to avoid shape mismatch.
+        for chunk_start in range(0, io_pages, self.storage_batch_size):
+            chunk_end = min(chunk_start + self.storage_batch_size, io_pages)
+            chunk_pages = chunk_end - chunk_start
 
-        # copy scratch -> IO buffer slice (sync on current stream)
-        io_k = self._async_store_io_buf[0, io_start_page : io_start_page + io_pages]
-        io_v = self._async_store_io_buf[1, io_start_page : io_start_page + io_pages]
-        io_k.copy_(packed_k)
-        io_v.copy_(packed_v)
+            packed_k = self._packed_scratch[0, :chunk_pages]
+            packed_v = self._packed_scratch[1, :chunk_pages]
 
-        # build keys/ptrs/sizes (2 keys per page)
+            chunk_flat_idx = page_token_idx[chunk_start:chunk_end].reshape(-1)
+
+            for layer_id in range(layer_num):
+                k_layer = self.mem_pool_device._get_key_buffer(layer_id)
+                v_layer = self.mem_pool_device._get_value_buffer(layer_id)
+                packed_k[:, layer_id] = k_layer.index_select(0, chunk_flat_idx).view(
+                    chunk_pages, self.page_size, head_num, head_dim
+                )
+                packed_v[:, layer_id] = v_layer.index_select(0, chunk_flat_idx).view(
+                    chunk_pages, self.page_size, head_num, head_dim
+                )
+
+            # copy scratch -> IO buffer slice for this chunk
+            io_k = self._async_store_io_buf[
+                0, io_start_page + chunk_start : io_start_page + chunk_end
+            ]
+            io_v = self._async_store_io_buf[
+                1, io_start_page + chunk_start : io_start_page + chunk_end
+            ]
+            io_k.copy_(packed_k)
+            io_v.copy_(packed_v)
+
+        # build keys/ptrs/sizes (2 keys per page) from the IO buffer slice
+        io_k_all = self._async_store_io_buf[0, io_start_page : io_start_page + io_pages]
+        io_v_all = self._async_store_io_buf[1, io_start_page : io_start_page + io_pages]
+
         keys_kv: List[str] = []
         ptrs: List[int] = []
         sizes: List[int] = []
@@ -837,8 +853,8 @@ class HiCacheControllerDirect:
             keys_kv.append(f"{namespaced}_{self.tp_rank}_k")
             keys_kv.append(f"{namespaced}_{self.tp_rank}_v")
 
-            k_page = io_k[local_page_i]
-            v_page = io_v[local_page_i]
+            k_page = io_k_all[local_page_i]
+            v_page = io_v_all[local_page_i]
             ptrs.append(int(k_page.data_ptr()))
             ptrs.append(int(v_page.data_ptr()))
             sizes.append(int(k_page.nbytes))
