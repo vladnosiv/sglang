@@ -723,6 +723,39 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        # Pass async-store IO buffer sizing to the allocator (used by HiCache direct controller).
+        # This is intentionally not a mode switch: direct hicache always uses async-store.
+        if server_args.mem_io_buffer_gb is not None:
+            try:
+                # Convert GiB to pages in packed page-first layout:
+                # one page stores K+V for all layers: 2 * L * page_size * head_num * head_dim * dtype_size
+                kv = self.token_to_kv_pool_allocator.get_kvcache()
+                if hasattr(kv, "head_num") and hasattr(kv, "head_dim"):
+                    head_num = int(kv.head_num)
+                    head_dim = int(kv.head_dim)
+                    layer_num = int(kv.layer_num)
+                    dtype_size = int(
+                        torch.tensor([], dtype=kv.store_dtype).element_size()
+                    )
+                    bytes_per_page = (
+                        2
+                        * layer_num
+                        * self.page_size
+                        * head_num
+                        * head_dim
+                        * dtype_size
+                    )
+                    pages = int(
+                        (server_args.mem_io_buffer_gb * (1024**3)) // bytes_per_page
+                    )
+                    pages = max(pages, 0)
+                    setattr(
+                        self.token_to_kv_pool_allocator,
+                        "async_store_io_buffer_pages",
+                        pages,
+                    )
+            except Exception:
+                pass
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,

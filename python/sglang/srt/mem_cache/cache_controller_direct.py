@@ -1,7 +1,8 @@
 import logging
 import time
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_hash_list(
-    token_ids: List[int], prior_hash: str = None, page_size: int = 128
+    token_ids: List[int], prior_hash: Optional[str] = None, page_size: int = 128
 ) -> List[str]:
     assert len(token_ids) % page_size == 0
     hashes = []
@@ -62,10 +63,22 @@ class LoadStorageOperation:
         LoadStorageOperation.counter += 1
 
 
+@dataclass
+class _AsyncStoreTask:
+    keys: List[str]
+    ptrs: List[int]
+    sizes: List[int]
+    # (start_page, num_pages) slice in the IO buffer to free after IO completes
+    io_slice: Tuple[int, int]
+
+
 class HiCacheControllerDirect:
     # Fire-and-forget async STORE queue size (per process).
     # If full, STORE is dropped (logged) to avoid blocking decode.
     ASYNC_STORE_QUEUE_MAXSIZE = 1024
+
+    # Default async STORE IO buffer capacity (in pages). Can be overridden by CLI.
+    DEFAULT_ASYNC_STORE_IO_BUFFER_PAGES = 4096
 
     def __init__(
         self,
@@ -196,12 +209,65 @@ class HiCacheControllerDirect:
 
         self.load_queue: List[LoadStorageOperation] = []
 
-        # Async STORE (fire-and-forget)
+        # Async STORE (IO-only in background):
+        # - pack happens synchronously into a pre-registered scratch buffer
+        # - then we copy packed data into a slice of a single pre-registered IO buffer
+        # - background thread performs only batch_set() from that IO buffer slice
         self._store_queue: Queue = Queue(maxsize=self.ASYNC_STORE_QUEUE_MAXSIZE)
         self._store_thread = None
         self._store_stop = False
+
+        # IO buffer allocator state
+        self._async_store_io_buf = None
+        self._async_store_io_capacity_pages = int(
+            getattr(token_to_kv_pool_allocator, "async_store_io_buffer_pages", 0) or 0
+        )
+        if self._async_store_io_capacity_pages <= 0:
+            self._async_store_io_capacity_pages = (
+                self.DEFAULT_ASYNC_STORE_IO_BUFFER_PAGES
+            )
+
+        self._async_store_io_free: List[Tuple[int, int]] = [
+            (0, self._async_store_io_capacity_pages)
+        ]
+        self._async_store_io_inflight_pages = 0
+        self._async_store_io_drop_pages = 0
+
         # NOTE: avoid importing threading at module import time; do it lazily
         import threading  # local import
+
+        self._async_store_io_lock = threading.Lock()
+
+        if self.use_packed_page_first:
+            # IO buffer layout matches packed scratch: [2, pages, L, page_size, H, D]
+            head_num = int(self.mem_pool_device.head_num)
+            head_dim = int(self.mem_pool_device.head_dim)
+            layer_num = int(self.mem_pool_device.layer_num)
+            dtype = self.mem_pool_device.store_dtype
+            self._async_store_io_buf = torch.empty(
+                (
+                    2,
+                    self._async_store_io_capacity_pages,
+                    layer_num,
+                    self.page_size,
+                    head_num,
+                    head_dim,
+                ),
+                dtype=dtype,
+                device=self.device,
+            )
+            self.storage_backend.register_device_buffer(
+                self._async_store_io_buf.data_ptr(), self._async_store_io_buf.nbytes
+            )
+            io_gib = self._async_store_io_buf.nbytes / (1024**3)
+            logger.info(
+                "hicache_direct async STORE IO buffer allocated: pages=%d size=%.3f GiB (registered)",
+                self._async_store_io_capacity_pages,
+                io_gib,
+            )
+        else:
+            # MLA path currently uses scatter/gather; async-store is not enabled there.
+            self._async_store_io_buf = None
 
         self._store_thread = threading.Thread(
             target=self._store_thread_func, daemon=True
@@ -222,64 +288,115 @@ class HiCacheControllerDirect:
 
     def write(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
         """
-        Fire-and-forget STORE:
-        - enqueue a copy of device_indices (to keep it alive) and hash_keys
-        - return immediately (does not block decode)
+        Async STORE (MHA packed page-first):
+        - pack sync into pre-registered scratch
+        - copy sync into a slice of a pre-registered IO buffer
+        - enqueue IO-only task (batch_set) to background thread
         """
         if self.backup_skip:
             return 0
 
-        # Keep a private copy of indices so caller can free/reuse its tensor safely.
-        # (This is extra GPU memory, but bounded by queue size.)
-        try:
-            indices_copy = device_indices.to(
-                device_indices.device, dtype=device_indices.dtype, copy=True
-            )
-        except Exception:
-            # If copy fails, fall back to synchronous write (best-effort)
+        # Only packed page-first path is supported for async-store MVP.
+        if not self.use_packed_page_first or self._async_store_io_buf is None:
+            # Best-effort fallback to sync (keeps behavior for MLA / non-packed)
             try:
                 succ_pages_num = self._memcpy_between_device_and_storage(
                     hash_keys, device_indices, "write"
                 )
                 if self.tp_world_size > 1 and self.is_mla_model is False:
                     succ_pages_num = self._allreduce_results(succ_pages_num)
-                logger.debug(f"success write {succ_pages_num} pages (sync fallback)")
                 return succ_pages_num * self.page_size
             except Exception:
                 return 0
 
-        try:
-            self._store_queue.put_nowait((list(hash_keys), indices_copy))
-            return len(hash_keys) * self.page_size
-        except Full:
+        token_len = int(device_indices.shape[0])
+        if token_len == 0:
+            return 0
+        assert token_len % self.page_size == 0
+        num_pages = token_len // self.page_size
+        assert num_pages == len(hash_keys)
+
+        # Allocate IO-buffer slice (pages)
+        io_slice = self._async_store_io_alloc(num_pages)
+        if io_slice is None:
+            self._async_store_io_drop_pages += num_pages
             logger.warning(
-                "hicache_direct STORE dropped: async queue full (maxsize=%d), pages=%d",
+                "hicache_direct STORE dropped: async IO buffer full, pages=%d (dropped_total_pages=%d)",
+                num_pages,
+                self._async_store_io_drop_pages,
+            )
+            return 0
+
+        start_page, slice_pages = io_slice
+        assert slice_pages == num_pages
+
+        # Pack into scratch and copy into IO buffer slice
+        try:
+            keys, ptrs, sizes = self._pack_pages_for_async_store(
+                hash_keys=hash_keys,
+                device_indices=device_indices,
+                io_start_page=start_page,
+                io_pages=slice_pages,
+            )
+        except Exception:
+            # On failure, free slice and drop
+            self._async_store_io_free_slice(start_page, slice_pages)
+            raise
+
+        task = _AsyncStoreTask(keys=keys, ptrs=ptrs, sizes=sizes, io_slice=io_slice)
+        try:
+            self._store_queue.put_nowait(task)
+            return num_pages * self.page_size
+        except Full:
+            self._async_store_io_free_slice(start_page, slice_pages)
+            self._async_store_io_drop_pages += num_pages
+            logger.warning(
+                "hicache_direct STORE dropped: async queue full (maxsize=%d), pages=%d (dropped_total_pages=%d)",
                 self.ASYNC_STORE_QUEUE_MAXSIZE,
-                len(hash_keys),
+                num_pages,
+                self._async_store_io_drop_pages,
             )
             return 0
 
     def _store_thread_func(self):
         while not self._store_stop:
             try:
-                item = self._store_queue.get(timeout=0.1)
+                task: _AsyncStoreTask = self._store_queue.get(timeout=0.1)
             except Empty:
                 continue
             try:
-                hash_keys, device_indices = item
-                succ_pages_num = self._memcpy_between_device_and_storage(
-                    hash_keys, device_indices, "write"
+                # IO-only: batch_set from pre-registered IO buffer slice
+                succ_raw = self.storage_backend.batch_set(
+                    keys=task.keys, target_locations=task.ptrs, target_sizes=task.sizes
                 )
+                if isinstance(succ_raw, bool):
+                    succ_keys = len(task.keys) if succ_raw else 0
+                elif isinstance(succ_raw, list):
+                    succ_keys = 0
+                    for r in succ_raw:
+                        if r != 0:
+                            break
+                        succ_keys += 1
+                else:
+                    succ_keys = int(succ_raw)
+
+                succ_pages = succ_keys // 2
                 if self.tp_world_size > 1 and self.is_mla_model is False:
-                    succ_pages_num = self._allreduce_results(succ_pages_num)
+                    succ_pages = self._allreduce_results(succ_pages)
+
                 logger.debug(
                     "hicache_direct async STORE done: succ_pages=%d/%d",
-                    succ_pages_num,
-                    len(hash_keys),
+                    succ_pages,
+                    task.io_slice[1],
                 )
             except Exception as e:
                 logger.exception("hicache_direct async STORE failed: %s", e)
             finally:
+                # Always free IO slice
+                try:
+                    self._async_store_io_free_slice(task.io_slice[0], task.io_slice[1])
+                except Exception:
+                    pass
                 try:
                     self._store_queue.task_done()
                 except Exception:
@@ -411,6 +528,22 @@ class HiCacheControllerDirect:
         )
         return total_hit_num
 
+    def _async_store_io_alloc(self, pages: int) -> Optional[Tuple[int, int]]:
+        if pages <= 0:
+            return None
+        with self._async_store_io_lock:
+            for i, (start, length) in enumerate(self._async_store_io_free):
+                if length >= pages:
+                    alloc = (start, pages)
+                    # shrink or remove free segment
+                    if length == pages:
+                        self._async_store_io_free.pop(i)
+                    else:
+                        self._async_store_io_free[i] = (start + pages, length - pages)
+                    self._async_store_io_inflight_pages += pages
+                    return alloc
+        return None
+
     def _memcpy_between_device_and_storage(
         self,
         hash_keys: List[str],
@@ -439,16 +572,51 @@ class HiCacheControllerDirect:
             batch_hashes = hash_keys[start:end]
             target_locations = ptr_list[start:end]
             target_sizes = element_size_list[start:end]
-            succ_num = batch_memcpy(
+            succ_raw = batch_memcpy(
                 keys=batch_hashes,
                 target_locations=target_locations,
                 target_sizes=target_sizes,
             )
+            # Normalize return type to int (number of successful pages)
+            if isinstance(succ_raw, bool):
+                succ_num = len(batch_hashes) if succ_raw else 0
+            elif isinstance(succ_raw, list):
+                succ_num = 0
+                for r in succ_raw:
+                    ok = (
+                        (r == 0) if direction == "write" else (r is not None and r >= 0)
+                    )
+                    if not ok:
+                        break
+                    succ_num += 1
+            else:
+                succ_num = int(succ_raw)
+
             total_succ_num += succ_num
             if succ_num < len(batch_hashes):
                 break
 
         return total_succ_num
+
+    def _async_store_io_free_slice(self, start_page: int, pages: int) -> None:
+        if pages <= 0:
+            return
+        with self._async_store_io_lock:
+            self._async_store_io_inflight_pages -= pages
+            self._async_store_io_free.append((start_page, pages))
+            # coalesce
+            self._async_store_io_free.sort(key=lambda x: x[0])
+            merged: List[Tuple[int, int]] = []
+            for s, l in self._async_store_io_free:
+                if not merged:
+                    merged.append((s, l))
+                    continue
+                ps, pl = merged[-1]
+                if ps + pl == s:
+                    merged[-1] = (ps, pl + l)
+                else:
+                    merged.append((s, l))
+            self._async_store_io_free = merged
 
     def _memcpy_packed_page_first(
         self,
@@ -612,6 +780,71 @@ class HiCacheControllerDirect:
         )
 
         return total_succ_pages
+
+    def _pack_pages_for_async_store(
+        self,
+        hash_keys: List[str],
+        device_indices: torch.Tensor,
+        io_start_page: int,
+        io_pages: int,
+    ) -> tuple[List[str], List[int], List[int]]:
+        """
+        Pack pages into scratch, then copy into IO buffer slice, and return (keys, ptrs, sizes)
+        for batch_set().
+        """
+        assert self.use_packed_page_first
+        assert self._packed_scratch is not None
+        assert self._async_store_io_buf is not None
+        assert io_pages == len(hash_keys)
+
+        token_len = int(device_indices.shape[0])
+        assert token_len % self.page_size == 0
+        num_pages = token_len // self.page_size
+        assert num_pages == io_pages
+
+        page_token_idx = device_indices.view(num_pages, self.page_size)
+        flat_idx = page_token_idx.reshape(-1)
+
+        head_num = int(self.mem_pool_device.head_num)
+        head_dim = int(self.mem_pool_device.head_dim)
+        layer_num = int(self.mem_pool_device.layer_num)
+
+        # pack into scratch
+        packed_k = self._packed_scratch[0, :io_pages]
+        packed_v = self._packed_scratch[1, :io_pages]
+        for layer_id in range(layer_num):
+            k_layer = self.mem_pool_device._get_key_buffer(layer_id)
+            v_layer = self.mem_pool_device._get_value_buffer(layer_id)
+            packed_k[:, layer_id] = k_layer.index_select(0, flat_idx).view(
+                io_pages, self.page_size, head_num, head_dim
+            )
+            packed_v[:, layer_id] = v_layer.index_select(0, flat_idx).view(
+                io_pages, self.page_size, head_num, head_dim
+            )
+
+        # copy scratch -> IO buffer slice (sync on current stream)
+        io_k = self._async_store_io_buf[0, io_start_page : io_start_page + io_pages]
+        io_v = self._async_store_io_buf[1, io_start_page : io_start_page + io_pages]
+        io_k.copy_(packed_k)
+        io_v.copy_(packed_v)
+
+        # build keys/ptrs/sizes (2 keys per page)
+        keys_kv: List[str] = []
+        ptrs: List[int] = []
+        sizes: List[int] = []
+        for local_page_i, base_key in enumerate(hash_keys):
+            namespaced = f"{self.key_namespace}_{base_key}"
+            keys_kv.append(f"{namespaced}_{self.tp_rank}_k")
+            keys_kv.append(f"{namespaced}_{self.tp_rank}_v")
+
+            k_page = io_k[local_page_i]
+            v_page = io_v[local_page_i]
+            ptrs.append(int(k_page.data_ptr()))
+            ptrs.append(int(v_page.data_ptr()))
+            sizes.append(int(k_page.nbytes))
+            sizes.append(int(v_page.nbytes))
+
+        return keys_kv, ptrs, sizes
 
     def _parse_success_hashes_from_l3_results(
         self,

@@ -283,6 +283,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    mem_io_buffer_gb: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
@@ -2383,6 +2384,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--mem-io-buffer-gb",
+            type=float,
+            default=ServerArgs.mem_io_buffer_gb,
+            help="GPU memory reserved for HiCache direct async STORE IO buffer (GiB). If not set, a default is used.",
         )
         parser.add_argument(
             "--max-running-requests",
