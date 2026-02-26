@@ -661,6 +661,12 @@ class Scheduler(
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
+            attn_cp_cache_group=(
+                self.attn_cp_cpu_group if self.server_args.enable_dp_attention else None
+            ),
+            attn_tp_cache_group=(
+                self.attn_tp_cpu_group if self.server_args.enable_dp_attention else None
+            ),
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
