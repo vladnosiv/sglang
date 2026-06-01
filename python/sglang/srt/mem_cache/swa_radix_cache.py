@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from numpy import float64
 
@@ -991,8 +992,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # the constructor defaults to False, so concat without explicit flag
             # silently demotes EAGLE/MTP bigram keys → match() returns 0 →
             # _split_node assert.
+            # token_ids is now a numpy ndarray (slicing is O(1) views); use
+            # np.concatenate instead of `+` which would be elementwise add.
             node.key = RadixKey(
-                node.key.token_ids + child.key.token_ids,
+                np.concatenate([node.key.token_ids, child.key.token_ids]),
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
             )

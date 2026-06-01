@@ -30,7 +30,10 @@ from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
+
+_EMPTY_INT64 = np.empty(0, dtype=np.int64)
 
 logger = logging.getLogger(__name__)
 
@@ -60,15 +63,21 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: array[int],
+        token_ids,
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
-        # token ids sequence (raw ints in both modes)
+        # Backing buffer is always a contiguous int64 ndarray so slicing is O(1)
+        # (numpy view) instead of O(N) memcpy. Internal callers (e.g. __getitem__,
+        # _split_node) pass an int64 ndarray view and share its buffer; external
+        # callers pass a list / array.array / tensor and pay a single copy here.
+        if isinstance(token_ids, np.ndarray):
+            if token_ids.dtype != np.int64:
+                token_ids = token_ids.astype(np.int64)
+        else:
+            token_ids = np.array(token_ids, dtype=np.int64)
         self.token_ids = token_ids
-        # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
-        # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
 
     def __len__(self) -> int:
@@ -101,7 +110,8 @@ class RadixKey:
         if self.is_bigram:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
+            # numpy slice is an O(1) view into the same buffer (no memcpy).
+            raw = self.token_ids[start : stop + 1] if stop > start else _EMPTY_INT64
             return RadixKey(raw, self.extra_key, is_bigram=True)
         return RadixKey(self.token_ids[start:stop], self.extra_key)
 
@@ -135,7 +145,6 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
@@ -143,29 +152,32 @@ class RadixKey:
 
         if self.is_bigram:
             # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            min_raw = min(len(t0), len(t1))
+            if min_raw == 0:
+                raw_match = 0
+            else:
+                diff = t0[:min_raw] != t1[:min_raw]
+                nz = np.flatnonzero(diff)
+                raw_match = int(nz[0]) if nz.size else min_raw
+            matched = max(0, min(raw_match - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
+        min_len = min(len(t0), len(t1))
+        if min_len == 0:
+            return 0
+        if page_size > 1:
+            aligned = (min_len // page_size) * page_size
+            if aligned == 0:
+                return 0
+            diff = t0[:aligned] != t1[:aligned]
+            nz = np.flatnonzero(diff)
+            if nz.size == 0:
+                return aligned
+            return (int(nz[0]) // page_size) * page_size
 
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+        diff = t0[:min_len] != t1[:min_len]
+        nz = np.flatnonzero(diff)
+        return int(nz[0]) if nz.size else min_len
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -185,14 +197,24 @@ class RadixKey:
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids
+        # np.int64 has no .to_bytes(); cast via int() at each element. This path
+        # isn't profile-hot (HiCache event emission only), so per-element boxing
+        # is fine here.
         if self.is_bigram:
             for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-                hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
+                hasher.update(int(t[j]).to_bytes(4, byteorder="little", signed=False))
+                hasher.update(int(t[j + 1]).to_bytes(4, byteorder="little", signed=False))
         else:
             for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
+                hasher.update(int(t[j]).to_bytes(4, byteorder="little", signed=False))
         return hasher.hexdigest()
+
+    def _materialize(self) -> "RadixKey":
+        """Detach from any parent buffer so a tree node never pins a large
+        request-scoped backing array alive when it only references a window."""
+        if self.token_ids.base is None:
+            return self
+        return RadixKey(self.token_ids.copy(), self.extra_key, self.is_bigram)
 
 
 class TreeNode:
@@ -714,7 +736,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
+            # Materialize so the new leaf owns its buffer (instead of pinning the
+            # full request-scoped fill_ids array alive via a view).
+            new_node.key = key._materialize()
             new_node.value = value.clone()
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
