@@ -38,6 +38,9 @@ change, not a requirement to beat the Host path in isolated I/O latency.
 The first PR introduces no GPU behavior and no new user-facing flag. It:
 
 - adds `TransientBufferBackend` and opaque `TransientBufferLease` objects;
+- keeps the neutral contract in `transient_buffer.py` and the concrete Host
+  implementation in `host_transient_buffer.py`, leaving a symmetric module
+  boundary for the future GPU implementation;
 - moves Host allocation, D2H/H2D copies, storage submission, pressure gates,
   partial-prefetch trimming, and terminal release into
   `HostTransientBufferBackend`;

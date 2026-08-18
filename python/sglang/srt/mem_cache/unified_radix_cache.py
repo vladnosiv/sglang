@@ -25,15 +25,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.buffer_mode.host_transient_buffer import (
+    HostTransientBufferBackend,
+    validate_host_transient_buffer_stack,
+)
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.buffer_mode.transient_buffer import (
-    HostTransientBufferBackend,
-    TransientBufferLease,
-    validate_host_transient_buffer_stack,
-)
+from sglang.srt.mem_cache.buffer_mode.transient_buffer import TransientBufferLease
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
