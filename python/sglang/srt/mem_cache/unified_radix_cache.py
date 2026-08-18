@@ -25,13 +25,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.buffer_mode.pipeline import (
-    BufferModePipeline,
-    validate_buffer_only_stack,
+from sglang.srt.mem_cache.buffer_mode.host_transient_buffer import (
+    HostTransientBufferBackend,
+    validate_host_transient_buffer_stack,
 )
+from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
+from sglang.srt.mem_cache.buffer_mode.transient_buffer import TransientBufferLease
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -134,14 +136,15 @@ class _OngoingLoadBack(NamedTuple):
 
 
 class _OngoingPrefetch(NamedTuple):
-    """Tracks an in-flight storage→host prefetch operation."""
+    """Tracks an in-flight storage prefetch and its mode-specific payload."""
 
     anchor_node_id: NodeId
     prefetch_key: RadixKey
-    host_indices: torch.Tensor
+    host_indices: Optional[torch.Tensor]
     operation: PrefetchOperation
-    anchor_lock_params: DecLockRefParams
+    anchor_lock_params: Optional[DecLockRefParams]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    transient_buffer: Optional[TransientBufferLease] = None
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -414,17 +417,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
         if self.host_memory_mode == "buffer_only":
+            assert self.cache_controller is not None
             swa = self.components.get(ComponentType.SWA)
-            validate_buffer_only_stack(
+            validate_host_transient_buffer_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs, swa_component=swa
             )
-            self.buffer_pipeline = BufferModePipeline(
-                cache=self,
+            transient_buffer = HostTransientBufferBackend(
+                self.cache_controller,
                 swa_window_pages=(
                     swa.full_window_pages
                     if swa is not None and self.tree_core.has_swa_host_pool
                     else 0
                 ),
+            )
+            self.buffer_pipeline = BufferModePipeline(
+                cache=self,
+                transient_buffer=transient_buffer,
                 # Leak backstop only: live queued tokens are intrinsically
                 # bounded by the FULL device pool (one intent per node, stale
                 # intents swept per tick), so a cap that binds on live
@@ -1726,17 +1734,29 @@ class UnifiedRadixCache(BasePrefixCache):
             operation,
             anchor_lock_params,
             comp_xfers,
+            transient_buffer,
         ) = self.ongoing_prefetch[req_id]
         if not self.can_terminate_prefetch(operation):
             return False
-        if operation.host_indices is None:
-            self.cache_controller.terminate_prefetch(operation)
+        buffer_mode = self.buffer_pipeline is not None
+        if (buffer_mode and transient_buffer is None) or (
+            not buffer_mode and operation.host_indices is None
+        ):
+            if buffer_mode:
+                self.buffer_pipeline.terminate_prefetch(operation)
+            else:
+                self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(req_id)
             return True
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
+        if buffer_mode:
+            completed_tokens, hash_value = self.buffer_pipeline.terminate_prefetch(
+                operation
+            )
+        else:
+            completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+                operation
+            )
 
         min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
             req_id,
@@ -1747,19 +1767,26 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node_id,
             anchor_lock_params,
             prefetch_key,
+            transient_buffer,
         )
         if min_completed_tokens is None:
             # Hybrid all-or-nothing check failed; result already discarded.
             return True
 
-        if self.buffer_pipeline is not None:
-            # No graft: release the rank-local tail beyond the synced usable
-            # length, then park the bounce for admission-time consumption.
-            self.cache_controller.append_host_mem_release(
-                host_indices[min_completed_tokens:completed_tokens]
+        if buffer_mode:
+            assert transient_buffer is not None
+            # No graft: trim the backend-owned payload to the synchronized
+            # usable prefix, then park it for admission-time consumption.
+            transient_buffer = self.buffer_pipeline.finalize_prefetch(
+                transient_buffer,
+                usable_tokens=min_completed_tokens,
+                completed_tokens=completed_tokens,
+            )
+            self.ongoing_prefetch[req_id] = self.ongoing_prefetch[req_id]._replace(
+                transient_buffer=transient_buffer
             )
             return self.buffer_pipeline.stage_completed_prefetch(
-                req_id, min_completed_tokens, hash_value
+                req_id, min_completed_tokens, hash_value, transient_buffer
             )
 
         fetched_key = prefetch_key[:min_completed_tokens]
@@ -1829,10 +1856,11 @@ class UnifiedRadixCache(BasePrefixCache):
         operation: PrefetchOperation,
         completed_tokens: int,
         hash_value: list[str],
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         last_host_node_id: NodeId,
-        anchor_lock_params: DecLockRefParams,
+        anchor_lock_params: Optional[DecLockRefParams],
         prefetch_key: RadixKey,
+        transient_buffer: Optional[TransientBufferLease] = None,
     ) -> Optional[int]:
         """Sync prefetch results across ATTN groups and decide the usable prefix.
 
@@ -1885,20 +1913,29 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
-            # The controller's prefetch IO thread already releases the untransferred
-            # tail (host_indices[completed_tokens:])
-            self.cache_controller.append_host_mem_release(
-                host_indices=host_indices[:completed_tokens],
-                extra_pools=pool_transfers,
-            )
+            # The active backend owns the uncompleted tail; discard releases
+            # the completed prefix and any auxiliary resources.
+            if self.buffer_pipeline is not None:
+                assert transient_buffer is not None
+                self.buffer_pipeline.discard_prefetch(
+                    transient_buffer, completed_tokens=completed_tokens
+                )
+            else:
+                assert host_indices is not None
+                self.cache_controller.append_host_mem_release(
+                    host_indices=host_indices[:completed_tokens],
+                    extra_pools=pool_transfers,
+                )
             if anchor_lock_params is not None:
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             del self.ongoing_prefetch[req_id]
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.pop_prefix_ctx(req_id)
-            self.cache_controller.prefetch_tokens_occupied -= (
-                self._prefetch_occupied_span(prefetch_key, host_indices)
-            )
+                self.cache_controller.prefetch_tokens_occupied -= (
+                    transient_buffer.accounted_tokens
+                )
+            else:
+                self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
                 "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
@@ -1942,28 +1979,43 @@ class UnifiedRadixCache(BasePrefixCache):
             operation,
             anchor_lock_params,
             comp_xfers,
+            transient_buffer,
         ) = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            self.cache_controller.terminate_prefetch(operation)
+        buffer_mode = self.buffer_pipeline is not None
+        if (buffer_mode and transient_buffer is None) or (
+            not buffer_mode and operation.host_indices is None
+        ):
+            if buffer_mode:
+                self.buffer_pipeline.terminate_prefetch(operation)
+            else:
+                self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)
             return
 
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+        if buffer_mode:
+            completed_tokens, _ = self.buffer_pipeline.terminate_prefetch(operation)
+        else:
+            completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         self._barrier_attn_groups()
         if anchor_lock_params is not None:
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(rid)
-        self.cache_controller.append_host_mem_release(
-            host_indices=host_indices[:completed_tokens],
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
-        )
-        # Buffer mode granted occupancy at hit-alloc, sized to the bounce;
-        # cache mode reserved the requested span at enqueue.
-        self.cache_controller.prefetch_tokens_occupied -= self._prefetch_occupied_span(
-            prefetch_key, host_indices
-        )
+        if buffer_mode:
+            assert transient_buffer is not None
+            self.buffer_pipeline.discard_prefetch(
+                transient_buffer, completed_tokens=completed_tokens
+            )
+            self.cache_controller.prefetch_tokens_occupied -= (
+                transient_buffer.accounted_tokens
+            )
+        else:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            )
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
     def _invalidate_absent_from_hit_query(self, operation) -> None:
         """Drop KV beliefs beyond the folded usable cut (rank-synced): the
@@ -2010,14 +2062,6 @@ class UnifiedRadixCache(BasePrefixCache):
             "occupancy_ratio": cc.prefetch_tokens_occupied / cap,
         }
 
-    def _prefetch_occupied_span(self, prefetch_key, host_indices) -> int:
-        """Occupancy units held by a prefetch: cache mode reserves the
-        requested span at enqueue; buffer mode grants at hit-alloc, sized
-        to the allocation (0 while still querying / parked)."""
-        if self.host_memory_mode == "buffer_only":
-            return len(host_indices) if host_indices is not None else 0
-        return len(prefetch_key)
-
     def _revoke_pending_prefetch(self, req_id: str) -> None:
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
@@ -2029,25 +2073,30 @@ class UnifiedRadixCache(BasePrefixCache):
             operation,
             anchor_lock_params,
             comp_xfers,
+            transient_buffer,
         ) = info
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(req_id)
         cc = self.cache_controller
-        cc.append_host_mem_release(
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
-        )
+        if self.buffer_pipeline is not None:
+            # Query revocation happens before receive-buffer acquisition.
+            assert transient_buffer is None
+            self.buffer_pipeline.release_unstarted_prefetch(operation.pool_transfers)
+        else:
+            cc.append_host_mem_release(
+                extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+            )
         if anchor_lock_params is not None:
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
         assert _host_indices is None or self.host_memory_mode != "buffer_only"
-        cc.prefetch_tokens_occupied = max(
-            0,
-            cc.prefetch_tokens_occupied
-            - self._prefetch_occupied_span(prefetch_key, _host_indices),
-        )
+        if self.buffer_pipeline is None:
+            cc.prefetch_tokens_occupied = max(
+                0, cc.prefetch_tokens_occupied - len(prefetch_key)
+            )
 
     def _drain_storage_control_queues_impl(
         self,
@@ -2083,19 +2132,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._revoke_pending_prefetch(req_id)
                 return True
 
-            if buffer_mode and cc.prefetch_rate_limited():
-                # Pool is load-saturated: hold the KNOWN hit until staged
-                # prefetches ahead of us are consumed. The op stays in
-                # ongoing_prefetch, so wait_complete keeps gating admission.
-                return False
+            if buffer_mode:
+                transient_buffer = self.buffer_pipeline.try_start_prefetch(operation)
+                if transient_buffer is None:
+                    # Backend credits are saturated: hold the known hit until
+                    # staged prefetches ahead of us are consumed.
+                    return False
+                self.ongoing_prefetch[req_id] = info._replace(
+                    transient_buffer=transient_buffer
+                )
+                cc.prefetch_tokens_occupied += transient_buffer.accounted_tokens
+                return True
+
             alloc_len = operation.storage_hit_count
             host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
                 self.evict_host(alloc_len)
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
+            if host_indices is None:
                 # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
                 available_size = cc.mem_pool_host.available_size()
                 alloc_len = min(
                     operation.storage_hit_count,
@@ -2104,8 +2159,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 if alloc_len >= self.prefetch_threshold:
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
-                if buffer_mode:
-                    return False
                 self._revoke_pending_prefetch(req_id)
                 return True
 
@@ -2113,8 +2166,6 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
-            if buffer_mode:
-                cc.prefetch_tokens_occupied += alloc_len
             cc.prefetch_buffer.put(operation)
             return True
 
