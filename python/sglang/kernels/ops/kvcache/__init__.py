@@ -74,6 +74,8 @@ _TRITON_KERNELS = [
     ("cache_move", "store_cache_4d"),
     ("cache_move", "set_kv_buffer_prefix_valid_tiled"),
     ("cache_move", "copy_all_layer_kv_cache_tiled"),
+    ("gpu_transient", "copy_token_rows"),
+    ("gpu_transient", "copy_opaque_pages"),
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),
 ]

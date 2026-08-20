@@ -55,6 +55,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        tree_cache.staged_prefetch_device_tokens_reserved.return_value = 0
         return tree_cache
 
     def create_token_allocator(
@@ -99,6 +100,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
+        req.swa_host_hit_length = 0
         req.storage_hit_length = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
@@ -658,6 +660,27 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(delayer.calls, [])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_gpu_prefetch_reserved_pages_are_credited_at_admission(self):
+        """A staged GPU GET already owns its FULL destination pages.
+
+        The allocator's available size therefore excludes the hit span. The
+        adder must charge only the uncached tail, decode reserve, and alignment
+        page or a large hit can reject itself forever while holding its pages.
+        """
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+        req = self._create_delayer_req(50)
+        req.host_hit_length = 50
+        self.mock_tree_cache.staged_prefetch_device_tokens_reserved.return_value = 50
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(delayer.calls, [True])
         self.assertEqual(adder.can_run_list, [])
 
     def test_delayer_not_consulted_when_post_lock_recheck_rejects(self):

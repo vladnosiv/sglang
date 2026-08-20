@@ -981,6 +981,12 @@ class UnifiedRadixCacheSuite:
             req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
         )
 
+        if self.cfg.has_mamba and not self.cfg.enable_mamba_extra_buffer:
+            self.assertIsNotNone(
+                req.mamba_pool_idx,
+                "the inserted tree node owns the donated Mamba slot",
+            )
+
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
         m = cache.match_prefix(
@@ -2837,6 +2843,16 @@ class UnifiedRadixCacheSuite:
         )
         self.assertTrue(cons.check_prefetch_progress(req_id))
         self.assertEqual(cons.pop_prefetch_loaded_tokens(req_id), len(seq))
+        expected_swa_charge = (
+            (
+                (self.cfg.sliding_window_size + self.cfg.page_size - 1)
+                // self.cfg.page_size
+            )
+            * self.cfg.page_size
+            if self.cfg.has_swa
+            else 0
+        )
+        self.assertEqual(cons.staged_prefetch_swa_tokens(req_id), expected_swa_charge)
         self.assertEqual(stats["l3_demand_requests"], 1)
         self.assertEqual(stats["l3_miss_tokens"], 0)
 
@@ -2963,6 +2979,11 @@ class UnifiedRadixCacheSuite:
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
+        self.assertEqual(
+            surfaced_swa_hit,
+            ((window + ps - 1) // ps) * ps,
+            "Host restore allocates a page-aligned trailing SWA window",
+        )
         reserved = (
             max(extend_need - window, 0)
             + min(extend_need + max_new, window)
@@ -3087,12 +3108,10 @@ class UnifiedRadixCacheSuite:
                 "sub-window prefetch did not stage",
             )
             self.assertTrue(
-                any(
-                    t.name == PoolName.SWA
-                    for t in cons2.buffer_pipeline.staged_prefetches[
-                        "subwin-req"
-                    ].aux_xfers
-                ),
+                PoolName.SWA
+                in cons2.buffer_pipeline.staged_prefetches[
+                    "subwin-req"
+                ].buffer.pool_names,
                 "sub-window fetch degraded to KV-only",
             )
             spliced = self._consume_staged_prefetch(
@@ -3147,7 +3166,7 @@ class UnifiedRadixCacheSuite:
             # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
             # matches comp_xfers stored in ongoing_prefetch (one live entry).
             for info in cache.ongoing_prefetch.values():
-                comp_xfers = info[-1]
+                comp_xfers = info.comp_xfers
                 names = [t.name for xfers in comp_xfers.values() for t in xfers]
                 if PoolName.SWA in names:
                     return 1 + names.index(PoolName.SWA), 1 + len(names)
@@ -6810,6 +6829,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                 mock.MagicMock(),
                 None,
                 {},
+                None,
             )
         }
         cache.cache_controller.terminate_prefetch.return_value = (

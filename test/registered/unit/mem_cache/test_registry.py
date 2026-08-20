@@ -33,6 +33,7 @@ def _make_ctx(
     testcase,
     *,
     backend=None,
+    hicache_storage_io_mode="host",
     enable_streaming=False,
     enable_lmcache=False,
     is_hybrid_swa=False,
@@ -49,6 +50,7 @@ def _make_ctx(
     server_args = _publish(
         testcase,
         radix_cache_backend=backend,
+        hicache_storage_io_mode=hicache_storage_io_mode,
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
@@ -259,6 +261,35 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_gpu_transient_routes_to_unified_radix_cache_without_env_flag(self):
+        ctx = _make_ctx(
+            self,
+            enable_hierarchical_cache=True,
+            hicache_storage_io_mode="gpu_transient",
+        )
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with (
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
+                return_value=False,
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                },
+            ),
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+        fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+            ctx.server_args, ctx.params
+        )
+        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_hi_radix_cache_when_hierarchical(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True)

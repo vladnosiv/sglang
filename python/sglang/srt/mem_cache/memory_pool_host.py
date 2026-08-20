@@ -64,7 +64,14 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
-    def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        layout: str = "layer_first",
+        *,
+        size_per_token: int | float = 0,
+    ):
         if size % page_size != 0:
             raise ValueError(
                 "LogicalHostPool size must be page-aligned, "
@@ -81,7 +88,7 @@ class LogicalHostPool:
         self.start_layer = 0
         self.end_layer = 0
         self.kv_buffer = None
-        self.size_per_token = 0
+        self.size_per_token = size_per_token
         self.allocator = None
         self.can_use_write_back_jit = True
         self.lock = threading.RLock()
@@ -172,11 +179,20 @@ class LogicalHostPool:
     def set_from_flat_data_page(self, index, data_page):
         pass
 
-    def get_page_buffer_meta(self, indices):
-        return None
+    def get_size_per_token(self):
+        return self.size_per_token
 
     def get_ksize_per_token(self):
-        return 0
+        return self.size_per_token
+
+    def get_hybrid_pool_buffer(self):
+        return []
+
+    def get_page_buffer_meta(self, indices):
+        raise RuntimeError("LogicalHostPool has no physical page buffers.")
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return False
 
 
 class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
