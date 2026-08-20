@@ -1193,6 +1193,9 @@ class GpuTransientBufferBackend(TransientBufferBackend):
         self._gpu_lease(lease)
         return False
 
+    def prefetch_device_tokens_reserved(self, lease: TransientBufferLease) -> int:
+        return self._gpu_lease(lease).num_tokens
+
     def storage_write_succeeded(self, lease: TransientBufferLease) -> Optional[bool]:
         state = self._gpu_lease(lease).state
         with state.lock:

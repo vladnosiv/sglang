@@ -401,6 +401,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def staged_prefetch_device_tokens_reserved(self, req_id: str) -> int:
+        """FULL device tokens already reserved for a staged prefetch."""
+        return 0
+
     def supports_streaming_session(self) -> bool:
         return False
 

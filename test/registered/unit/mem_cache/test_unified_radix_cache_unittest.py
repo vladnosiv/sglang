@@ -981,6 +981,12 @@ class UnifiedRadixCacheSuite:
             req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
         )
 
+        if self.cfg.has_mamba and not self.cfg.enable_mamba_extra_buffer:
+            self.assertIsNotNone(
+                req.mamba_pool_idx,
+                "the inserted tree node owns the donated Mamba slot",
+            )
+
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
         m = cache.match_prefix(
@@ -2837,6 +2843,16 @@ class UnifiedRadixCacheSuite:
         )
         self.assertTrue(cons.check_prefetch_progress(req_id))
         self.assertEqual(cons.pop_prefetch_loaded_tokens(req_id), len(seq))
+        expected_swa_charge = (
+            (
+                (self.cfg.sliding_window_size + self.cfg.page_size - 1)
+                // self.cfg.page_size
+            )
+            * self.cfg.page_size
+            if self.cfg.has_swa
+            else 0
+        )
+        self.assertEqual(cons.staged_prefetch_swa_tokens(req_id), expected_swa_charge)
         self.assertEqual(stats["l3_demand_requests"], 1)
         self.assertEqual(stats["l3_miss_tokens"], 0)
 
@@ -2963,6 +2979,11 @@ class UnifiedRadixCacheSuite:
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
+        self.assertEqual(
+            surfaced_swa_hit,
+            ((window + ps - 1) // ps) * ps,
+            "Host restore allocates a page-aligned trailing SWA window",
+        )
         reserved = (
             max(extend_need - window, 0)
             + min(extend_need + max_new, window)

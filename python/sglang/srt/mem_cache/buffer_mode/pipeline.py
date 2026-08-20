@@ -607,17 +607,18 @@ class BufferModePipeline:
         return f.num_tokens if f is not None else 0
 
     def staged_prefetch_swa_tokens(self, req_id: str) -> int:
-        """SWA device tokens consuming this staged prefetch will allocate (the
-        staged trailing window); surfaced as the request's swa_host_hit_length
-        so the adder's SWA gate charges the admission-time alloc."""
+        """SWA device tokens consuming this staged prefetch will allocate."""
         f = self.staged_prefetches.get(req_id)
         if f is None:
             return 0
-        return sum(
-            len(t.host_indices)
-            for t in f.aux_xfers
-            if t.name == PoolName.SWA and t.host_indices is not None
-        )
+        return self.transient_buffer.prefetch_swa_tokens_to_allocate(f.buffer)
+
+    def staged_prefetch_device_tokens_reserved(self, req_id: str) -> int:
+        """FULL device tokens already reserved by a staged prefetch."""
+        f = self.staged_prefetches.get(req_id)
+        if f is None:
+            return 0
+        return self.transient_buffer.prefetch_device_tokens_reserved(f.buffer)
 
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
         """Buffer-mode branch of init_load_back: consume the staged prefetch

@@ -1230,7 +1230,15 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        # GPU-transient prefetches allocate private destination pages before
+        # scheduler admission so MoonCake can write directly into them. Those
+        # pages have already reduced rem_total_tokens and must not be charged a
+        # second time through cand_extend_input_len.
+        staged_device_tokens = self.tree_cache.staged_prefetch_device_tokens_reserved(
+            req.rid
+        )
+        incremental_extend_tokens = max(cand_extend_input_len - staged_device_tokens, 0)
+        total_tokens = incremental_extend_tokens + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)

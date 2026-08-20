@@ -127,6 +127,14 @@ class TransientBufferBackend(ABC):
         """Whether admission must make room before ``restore()`` allocates."""
         return True
 
+    def prefetch_device_tokens_reserved(self, lease: TransientBufferLease) -> int:
+        """FULL tokens already removed from device availability by this lease."""
+        return 0
+
+    def prefetch_swa_tokens_to_allocate(self, lease: TransientBufferLease) -> int:
+        """SWA tokens that consuming this lease will allocate on device."""
+        return 0
+
     def storage_write_succeeded(self, lease: TransientBufferLease) -> Optional[bool]:
         """Return terminal storage status, or None for legacy ack semantics."""
         return None

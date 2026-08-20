@@ -838,7 +838,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             insert_params.key = radix_key
             insert_params.value = values
-            self.insert(insert_params)
+            result = self.insert(insert_params)
 
             # Free unaligned tail (+ deferred truncation tail)
             segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
@@ -1987,6 +1987,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is None:
             return 0
         return self.buffer_pipeline.staged_prefetch_swa_tokens(req_id)
+
+    def staged_prefetch_device_tokens_reserved(self, req_id: str) -> int:
+        """FULL device tokens already reserved by a staged prefetch."""
+        if self.buffer_pipeline is None:
+            return 0
+        return self.buffer_pipeline.staged_prefetch_device_tokens_reserved(req_id)
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)

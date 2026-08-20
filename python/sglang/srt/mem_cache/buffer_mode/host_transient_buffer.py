@@ -290,6 +290,14 @@ class HostTransientBufferBackend(TransientBufferBackend):
             },
         )
 
+    def prefetch_swa_tokens_to_allocate(self, lease: TransientBufferLease) -> int:
+        host_lease = self._host_lease(lease)
+        return sum(
+            int(transfer.host_indices.numel())
+            for transfer in host_lease.pool_transfers
+            if transfer.name == PoolName.SWA and transfer.host_indices is not None
+        )
+
     def release(self, lease: TransientBufferLease) -> None:
         host_lease = self._host_lease(lease)
         controller = self._controller
