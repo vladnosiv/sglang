@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
 
 import torch
 
@@ -107,6 +107,14 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+
+
+@dataclass(frozen=True)
+class DeviceRegion:
+    """One registered device-memory slice used by storage zero-copy I/O."""
+
+    ptr: int
+    size: int
 
 
 @dataclass(frozen=True)
@@ -216,6 +224,32 @@ class HiCacheStorage(ABC):
         Returns a dict mapping pool name to a per-entry success list.
         """
         raise NotImplementedError()
+
+    def register_device_buffers(self, buffers: Sequence[torch.Tensor]) -> None:
+        """Register fixed device buffers for direct storage I/O."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support registered device buffers."
+        )
+
+    def batch_get_v2_device(
+        self,
+        transfers: List[PoolTransfer],
+        regions: dict[PoolName, List[DeviceRegion]],
+    ) -> dict[PoolName, List[bool]]:
+        """Read page objects into registered device-memory regions."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support device-region GET."
+        )
+
+    def batch_set_v2_device(
+        self,
+        transfers: List[PoolTransfer],
+        regions: dict[PoolName, List[DeviceRegion]],
+    ) -> dict[PoolName, List[bool]]:
+        """Write page objects from registered device-memory regions."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support device-region PUT."
+        )
 
     def batch_get_v1(
         self,

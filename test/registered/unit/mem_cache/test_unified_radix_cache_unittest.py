@@ -3087,12 +3087,10 @@ class UnifiedRadixCacheSuite:
                 "sub-window prefetch did not stage",
             )
             self.assertTrue(
-                any(
-                    t.name == PoolName.SWA
-                    for t in cons2.buffer_pipeline.staged_prefetches[
-                        "subwin-req"
-                    ].aux_xfers
-                ),
+                PoolName.SWA
+                in cons2.buffer_pipeline.staged_prefetches[
+                    "subwin-req"
+                ].buffer.pool_names,
                 "sub-window fetch degraded to KV-only",
             )
             spliced = self._consume_staged_prefetch(
@@ -3147,7 +3145,7 @@ class UnifiedRadixCacheSuite:
             # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
             # matches comp_xfers stored in ongoing_prefetch (one live entry).
             for info in cache.ongoing_prefetch.values():
-                comp_xfers = info[-1]
+                comp_xfers = info.comp_xfers
                 names = [t.name for xfers in comp_xfers.values() for t in xfers]
                 if PoolName.SWA in names:
                     return 1 + names.index(PoolName.SWA), 1 + len(names)
@@ -6810,6 +6808,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                 mock.MagicMock(),
                 None,
                 {},
+                None,
             )
         }
         cache.cache_controller.terminate_prefetch.return_value = (
