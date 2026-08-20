@@ -14,6 +14,10 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.kvcache.gpu_transient import (
+    copy_opaque_pages,
+    copy_token_rows,
+)
 from sglang.srt.managers.cache_controller import HiCacheAck, StorageOperation
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.buffer_mode.transient_buffer import (
@@ -24,10 +28,6 @@ from sglang.srt.mem_cache.buffer_mode.transient_buffer import (
 from sglang.srt.mem_cache.gpu_transient import (
     RegisteredGpuRing,
     build_gpu_payload_layout,
-)
-from sglang.srt.mem_cache.gpu_transient.kernels import (
-    copy_opaque_pages,
-    copy_token_rows,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 
@@ -363,20 +363,28 @@ class GpuTransientBufferBackend(TransientBufferBackend):
             for obj in self._layout.objects_for_pool(pool_name):
                 if obj.codec == "token_rows":
                     copy_token_rows(
-                        obj,
+                        obj.layer_ptrs,
                         page_starts,
                         slot,
                         q_pages,
                         self._layout.combined_page_bytes,
+                        page_payload_bytes=obj.page_payload_bytes,
+                        local_layers=obj.local_layers,
+                        row_bytes=obj.row_bytes,
+                        ring_page_offset=obj.ring_page_offset,
                         pack=pack,
                     )
                 elif obj.codec == "opaque_pages":
                     copy_opaque_pages(
-                        obj,
+                        obj.layer_ptrs,
                         page_starts,
                         slot,
                         q_pages,
                         self._layout.combined_page_bytes,
+                        local_layers=obj.local_layers,
+                        row_bytes=obj.row_bytes,
+                        index_page_size=obj.index_page_size,
+                        ring_page_offset=obj.ring_page_offset,
                         pack=pack,
                     )
                 else:

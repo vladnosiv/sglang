@@ -3,8 +3,6 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.gpu_transient.layout import GpuPayloadObject
-
 
 @triton.jit
 def _copy_token_rows_kernel(
@@ -51,31 +49,35 @@ def _copy_token_rows_kernel(
 
 
 def copy_token_rows(
-    obj: GpuPayloadObject,
+    layer_ptrs,
     page_starts,
     ring_slot,
     q_pages: int,
     ring_page_stride: int,
     *,
+    page_payload_bytes: int,
+    local_layers: int,
+    row_bytes: int,
+    ring_page_offset: int,
     pack: bool,
 ) -> None:
     block = 16_384
-    bytes_per_layer_page = obj.page_payload_bytes // obj.local_layers
+    bytes_per_layer_page = page_payload_bytes // local_layers
     grid = (
         q_pages,
-        obj.local_layers,
+        local_layers,
         triton.cdiv(bytes_per_layer_page, block),
     )
     _copy_token_rows_kernel[grid](
-        obj.layer_ptrs,
+        layer_ptrs,
         page_starts,
         ring_slot,
         q_pages,
-        PAGE_SIZE=bytes_per_layer_page // obj.row_bytes,
-        LOCAL_LAYERS=obj.local_layers,
-        ROW_BYTES=obj.row_bytes,
+        PAGE_SIZE=bytes_per_layer_page // row_bytes,
+        LOCAL_LAYERS=local_layers,
+        ROW_BYTES=row_bytes,
         RING_PAGE_STRIDE=ring_page_stride,
-        RING_OBJECT_OFFSET=obj.ring_page_offset,
+        RING_OBJECT_OFFSET=ring_page_offset,
         BLOCK=block,
         PACK=pack,
         num_warps=8,
@@ -119,26 +121,30 @@ def _copy_opaque_pages_kernel(
 
 
 def copy_opaque_pages(
-    obj: GpuPayloadObject,
+    layer_ptrs,
     page_starts,
     ring_slot,
     q_pages: int,
     ring_page_stride: int,
     *,
+    local_layers: int,
+    row_bytes: int,
+    index_page_size: int,
+    ring_page_offset: int,
     pack: bool,
 ) -> None:
     block = 16_384
-    grid = (q_pages, obj.local_layers, triton.cdiv(obj.row_bytes, block))
+    grid = (q_pages, local_layers, triton.cdiv(row_bytes, block))
     _copy_opaque_pages_kernel[grid](
-        obj.layer_ptrs,
+        layer_ptrs,
         page_starts,
         ring_slot,
         q_pages,
-        LOCAL_LAYERS=obj.local_layers,
-        ROW_BYTES=obj.row_bytes,
-        INDEX_PAGE_SIZE=obj.index_page_size,
+        LOCAL_LAYERS=local_layers,
+        ROW_BYTES=row_bytes,
+        INDEX_PAGE_SIZE=index_page_size,
         RING_PAGE_STRIDE=ring_page_stride,
-        RING_OBJECT_OFFSET=obj.ring_page_offset,
+        RING_OBJECT_OFFSET=ring_page_offset,
         BLOCK=block,
         PACK=pack,
         num_warps=8,
