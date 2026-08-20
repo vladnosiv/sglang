@@ -2660,9 +2660,36 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "cache"
+    hicache_storage_io_mode: A[
+        str,
+        Arg(
+            help=(
+                "Where buffer-only HiCache stages storage payloads. 'host' "
+                "preserves the Host bounce path; 'gpu_transient' uses fixed "
+                "registered CUDA TX/RX rings with MoonCake."
+            ),
+            choices=["host", "gpu_transient"],
+        ),
+        NS("memory"),
+    ] = "host"
+    hicache_gpu_transient_wave_pages: A[
+        int,
+        "Maximum number of complete KV pages in one GPU-transient MoonCake wave.",
+        NS("memory"),
+    ] = 64
+    hicache_gpu_transient_ring_depth: A[
+        int,
+        "Number of registered GPU-transient slots in each TX and RX ring.",
+        NS("memory"),
+    ] = 2
+    hicache_gpu_transient_max_active_ops: A[
+        int,
+        "Maximum concurrently executing operations on the per-rank GPU-transient rings.",
+        NS("memory"),
+    ] = 1
     hicache_ratio: A[
         Optional[float],
-        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 1.0 for host-pool decode retraction.",
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in Host-backed buffer_only mode, or 1.0 for host-pool decode retraction. Must stay unset for gpu_transient storage I/O.",
         NS("memory"),
     ] = None
     hicache_size: A[
@@ -7363,13 +7390,18 @@ class ServerArgs:
 
         Runs before the dummy-model boundary: direct HostKVCache consumers
         (unit fixtures, dummy-model launches) must never see a None ratio.
-        buffer_only stages in flight rather than retaining, so it needs only
-        enough to cover the write backlog plus parked prefetches.
+        Host-backed buffer_only stages in flight rather than retaining, so it
+        needs only enough to cover the write backlog plus parked prefetches.
+        GPU-transient mode intentionally owns no Host payload pool.
 
         A decode server keeps the ratio unset here: kv_cache_builder resolves
         it against the retraction-backup backend (1.0 for host_pool, else 2.0).
         """
-        if self.hicache_ratio is None and self.disaggregation_mode != "decode":
+        if (
+            self.hicache_ratio is None
+            and self.disaggregation_mode != "decode"
+            and self.hicache_storage_io_mode != "gpu_transient"
+        ):
             self.hicache_ratio = (
                 1.2 if self.hicache_host_memory_mode == "buffer_only" else 2.0
             )
@@ -7394,6 +7426,12 @@ class ServerArgs:
 
         self._validate_hicache_host_memory_mode()
 
+        if self.hicache_storage_io_mode == "gpu_transient":
+            # Device storage I/O does not use hicache_io_backend. In particular,
+            # do not let the Host direct-I/O normalizer rewrite page_first into
+            # page_first_direct: that would describe a different storage ABI.
+            return
+
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
@@ -7410,11 +7448,69 @@ class ServerArgs:
                 f"got {self.hicache_host_memory_mode!r}"
             )
 
-        # Both modes are defaulted upstream (a decode server resolves the
+        if self.hicache_storage_io_mode not in ("host", "gpu_transient"):
+            raise ValueError(
+                "hicache_storage_io_mode must be 'host' or 'gpu_transient', "
+                f"got {self.hicache_storage_io_mode!r}"
+            )
+
+        gpu_transient = self.hicache_storage_io_mode == "gpu_transient"
+        if gpu_transient:
+            if self.hicache_host_memory_mode != "buffer_only":
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient requires "
+                    "--hicache-host-memory-mode buffer_only."
+                )
+            if self.hicache_storage_backend != "mooncake":
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient currently requires "
+                    "--hicache-storage-backend mooncake."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient is supported only on CUDA."
+                )
+            if self.page_size != 256:
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient currently requires "
+                    f"--page-size 256, got {self.page_size}."
+                )
+            if self.hicache_ratio is not None or self.hicache_size > 0:
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient owns no Host payload "
+                    "pool; do not pass --hicache-ratio or --hicache-size."
+                )
+            if self.hicache_mem_layout != "page_first":
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient currently preserves "
+                    "the MoonCake page_first storage ABI and requires "
+                    "--hicache-mem-layout page_first."
+                )
+            if self.dcp_size > 1:
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient does not support DCP."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--hicache-storage-io-mode gpu_transient does not yet support "
+                    "draft KV pools from speculative decoding."
+                )
+            if self.hicache_gpu_transient_wave_pages <= 0:
+                raise ValueError("--hicache-gpu-transient-wave-pages must be positive.")
+            if self.hicache_gpu_transient_ring_depth <= 0:
+                raise ValueError("--hicache-gpu-transient-ring-depth must be positive.")
+            if self.hicache_gpu_transient_max_active_ops != 1:
+                raise ValueError(
+                    "The initial GPU-transient implementation requires "
+                    "--hicache-gpu-transient-max-active-ops 1."
+                )
+
+        # Both Host-backed modes are defaulted upstream (a decode server resolves the
         # ratio later, in kv_cache_builder), so this fires only if that
         # defaulting regresses -- never build an unsized host pool.
         if (
-            self.hicache_size <= 0
+            not gpu_transient
+            and self.hicache_size <= 0
             and self.hicache_ratio is None
             and self.disaggregation_mode != "decode"
         ):

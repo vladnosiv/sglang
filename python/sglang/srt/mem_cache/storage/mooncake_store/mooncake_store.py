@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
+    DeviceRegion,
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -593,6 +594,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
+            self._registered_device_ranges: list[tuple[int, int]] = []
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -711,6 +713,127 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+
+    def register_device_buffers(self, buffers: Sequence[torch.Tensor]) -> None:
+        if self.config.standalone_storage:
+            raise RuntimeError(
+                "GPU-transient MoonCake I/O does not support standalone_storage: "
+                "the dummy-client mapping is Host-only."
+            )
+        for buffer in buffers:
+            if not buffer.is_cuda:
+                raise ValueError(
+                    "MoonCake device registration requires CUDA tensors, got "
+                    f"{buffer.device}."
+                )
+            super().register_buffer(buffer)
+            start = int(buffer.data_ptr())
+            self._registered_device_ranges.append((start, start + buffer.nbytes))
+
+    def _validate_device_regions(self, regions: List[DeviceRegion]) -> None:
+        for region in regions:
+            if region.size <= 0:
+                raise ValueError(
+                    f"MoonCake device region has invalid size {region.size}."
+                )
+            end = region.ptr + region.size
+            if not any(
+                start <= region.ptr and end <= registered_end
+                for start, registered_end in self._registered_device_ranges
+            ):
+                raise ValueError(
+                    "MoonCake device region is outside the registered GPU rings: "
+                    f"ptr={region.ptr}, size={region.size}."
+                )
+
+    def _primary_device_component_keys(
+        self, page_keys: List[str]
+    ) -> tuple[List[str], int]:
+        tagged_keys = self._tag_keys(page_keys)
+        if self.is_mla_backend:
+            return [f"{key}_{self.mla_suffix}_k" for key in tagged_keys], 1
+        if isinstance(self.mha_suffix, list):
+            raise ValueError(
+                "GPU-transient MoonCake I/O does not support split-head key expansion."
+            )
+        keys = []
+        for key in tagged_keys:
+            keys.extend([f"{key}_{self.mha_suffix}_k", f"{key}_{self.mha_suffix}_v"])
+        return keys, 2
+
+    def _batch_primary_device_io(
+        self,
+        transfers: List[PoolTransfer],
+        regions: dict[PoolName, List[DeviceRegion]],
+        *,
+        is_set: bool,
+    ) -> dict[PoolName, List[bool]]:
+        results: dict[PoolName, List[bool]] = {}
+        for transfer in transfers:
+            page_keys = transfer.keys or []
+            if not page_keys:
+                raise ValueError("MoonCake device I/O requires at least one page key.")
+            object_regions = regions.get(transfer.name)
+            if object_regions is None:
+                raise ValueError(f"Missing device regions for pool {transfer.name}.")
+            if transfer.name == PoolName.KV:
+                key_strs, key_multiplier = self._primary_device_component_keys(
+                    page_keys
+                )
+            else:
+                key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                    page_keys, transfer
+                )
+                key_strs = self._tag_keys(key_strs)
+            if len(object_regions) != len(key_strs):
+                raise ValueError(
+                    "MoonCake device key/region count mismatch: "
+                    f"keys={len(key_strs)}, regions={len(object_regions)}."
+                )
+            self._validate_device_regions(object_regions)
+            ptrs = [region.ptr for region in object_regions]
+            sizes = [region.size for region in object_regions]
+            if is_set:
+                tagged_keys = self._tag_keys(page_keys)
+                group_ids = (
+                    self._expand_group_ids(tagged_keys, key_multiplier)
+                    if self._can_use_group_semantics()
+                    else None
+                )
+                exist_result = self._batch_exist(key_strs)
+                io_results = [0 if state == 1 else -1 for state in exist_result]
+                missing = [i for i, state in enumerate(exist_result) if state != 1]
+                if missing:
+                    put_results = self._put_batch_zero_copy_impl(
+                        [key_strs[i] for i in missing],
+                        [ptrs[i] for i in missing],
+                        [sizes[i] for i in missing],
+                        self._filter_group_ids(group_ids, missing),
+                    )
+                    for index, result in zip(missing, put_results):
+                        io_results[index] = result
+            else:
+                io_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
+            results[transfer.name] = self._batch_postprocess(
+                io_results,
+                is_set_operate=is_set,
+                key_multiplier=key_multiplier,
+            )
+        return results
+
+    def batch_get_v2_device(
+        self,
+        transfers: List[PoolTransfer],
+        regions: dict[PoolName, List[DeviceRegion]],
+    ) -> dict[PoolName, List[bool]]:
+        return self._batch_primary_device_io(transfers, regions, is_set=False)
+
+    def batch_set_v2_device(
+        self,
+        transfers: List[PoolTransfer],
+        regions: dict[PoolName, List[DeviceRegion]],
+    ) -> dict[PoolName, List[bool]]:
+        return self._batch_primary_device_io(transfers, regions, is_set=True)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:

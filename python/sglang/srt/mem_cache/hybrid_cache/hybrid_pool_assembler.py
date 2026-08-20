@@ -164,15 +164,25 @@ def build_kv_only_group(
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_num = len(full_layer_mapping)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=page_size,
-        server_args=server_args,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        host_size=host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
+    if server_args.hicache_storage_io_mode == "gpu_transient":
+        kv_host_pool = LogicalHostPool(
+            # Controller plumbing still requires an anchor object, but GPU
+            # mode never allocates from it. Keep one metadata-only page so
+            # Host memory does not scale with L1 capacity or cache-hit length.
+            size=page_size,
+            page_size=page_size,
+            layout=server_args.hicache_mem_layout,
+        )
+    else:
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=page_size,
+            server_args=server_args,
+            use_mla=use_mla,
+            override_kv_cache_dim=override_kv_cache_dim,
+            host_size=host_size,
+            mtp_draft_device_pools=mtp_draft_device_pools,
+        )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
@@ -436,6 +446,7 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
+    gpu_transient = server_args.hicache_storage_io_mode == "gpu_transient"
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
@@ -487,13 +498,44 @@ def build_deepseek_v4_hicache_stack(
     c4_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
     }
-    num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
-        params=params,
-        server_args=server_args,
-        kvcache=kvcache,
-        page_size=page_size,
-        swa_page_size=kvcache.swa_page_size,
-    )
+    if gpu_transient:
+        from sglang.srt.mem_cache.gpu_transient.layout import (
+            build_gpu_payload_layout,
+        )
+
+        gpu_layout = build_gpu_payload_layout(kvcache, page_size)
+        payload_by_pool = {
+            obj.pool_name: obj.page_payload_bytes for obj in gpu_layout.objects
+        }
+        allocator = params.token_to_kv_pool_allocator
+        full_slots = getattr(allocator, "size_full", kvcache.size)
+        num_host_pages = (full_slots + page_size - 1) // page_size
+        swa_num_host_pages = (
+            kvcache.swa_size + kvcache.swa_page_size - 1
+        ) // kvcache.swa_page_size
+    else:
+        payload_by_pool = {}
+        num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
+            params=params,
+            server_args=server_args,
+            kvcache=kvcache,
+            page_size=page_size,
+            swa_page_size=kvcache.swa_page_size,
+        )
+
+    def make_logical_payload_pool(
+        pool_name: PoolName, *, pages: int, slot_page_size: int
+    ) -> LogicalHostPool:
+        payload_bytes = payload_by_pool[pool_name]
+        return LogicalHostPool(
+            pages * slot_page_size,
+            slot_page_size,
+            layout=server_args.hicache_mem_layout,
+            # Logical pools carry accounting metadata only. Some DSV4 physical
+            # pages (notably C4) are not byte-divisible by the 256-token page,
+            # so retain the exact page total as a power-of-two rational.
+            size_per_token=payload_bytes / slot_page_size,
+        )
 
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=server_args.hicache_mem_layout
@@ -510,18 +552,25 @@ def build_deepseek_v4_hicache_stack(
     ]
 
     if not is_unified_kv:
-        swa_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.SWA),
-            device_buffers=[
-                *kvcache.swa_kv_pool.kv_buffer,
-                *mtp_swa_device_buffers,
-            ],
-            item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
-            num_host_pages=swa_num_host_pages,
-            slot_page_size=kvcache.swa_page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=_get_allocator_type(server_args),
-        )
+        if gpu_transient:
+            swa_host_pool = make_logical_payload_pool(
+                PoolName.SWA,
+                pages=swa_num_host_pages,
+                slot_page_size=kvcache.swa_page_size,
+            )
+        else:
+            swa_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.SWA),
+                device_buffers=[
+                    *kvcache.swa_kv_pool.kv_buffer,
+                    *mtp_swa_device_buffers,
+                ],
+                item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
+                num_host_pages=swa_num_host_pages,
+                slot_page_size=kvcache.swa_page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
             build_pool_entry(
@@ -539,27 +588,41 @@ def build_deepseek_v4_hicache_stack(
 
     if c4_layer_mapping:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
-        c4_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4),
-            device_buffers=c4_device_buffers,
-            item_bytes=c4_item_bytes,
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=_get_allocator_type(server_args),
-        )
-        c4_indexer_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
-            device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            item_bytes=(
-                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
-                * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].element_size()
-            ),
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=_get_allocator_type(server_args),
-        )
+        if gpu_transient:
+            c4_host_pool = make_logical_payload_pool(
+                PoolName.DEEPSEEK_V4_C4,
+                pages=num_host_pages,
+                slot_page_size=page_size,
+            )
+            c4_indexer_host_pool = make_logical_payload_pool(
+                PoolName.DEEPSEEK_V4_C4_INDEXER,
+                pages=num_host_pages,
+                slot_page_size=page_size,
+            )
+        else:
+            c4_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4),
+                device_buffers=c4_device_buffers,
+                item_bytes=c4_item_bytes,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
+            c4_indexer_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
+                device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
+                item_bytes=(
+                    kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
+                    * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[
+                        0
+                    ].element_size()
+                ),
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
         entries.extend(
             [
                 build_pool_entry(
@@ -580,28 +643,40 @@ def build_deepseek_v4_hicache_stack(
         )
 
         if not is_unified_kv:
-            c4_state_host_pool = DeepSeekV4StateHostPool(
-                pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
-                state_pools=[
-                    kvcache.compress_state_pools[layer_id]
-                    for layer_id in c4_state_global_layers
-                ],
-                num_host_pages=swa_num_host_pages,
-                swa_page_size=kvcache.swa_page_size,
-                layout=server_args.hicache_mem_layout,
-                allocator_type=_get_allocator_type(server_args),
-            )
-            c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
-                pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
-                state_pools=[
-                    kvcache.indexer_compress_state_pools[layer_id]
-                    for layer_id in c4_state_global_layers
-                ],
-                num_host_pages=swa_num_host_pages,
-                swa_page_size=kvcache.swa_page_size,
-                layout=server_args.hicache_mem_layout,
-                allocator_type=_get_allocator_type(server_args),
-            )
+            if gpu_transient:
+                c4_state_host_pool = make_logical_payload_pool(
+                    PoolName.DEEPSEEK_V4_C4_STATE,
+                    pages=swa_num_host_pages,
+                    slot_page_size=kvcache.swa_page_size,
+                )
+                c4_indexer_state_host_pool = make_logical_payload_pool(
+                    PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                    pages=swa_num_host_pages,
+                    slot_page_size=kvcache.swa_page_size,
+                )
+            else:
+                c4_state_host_pool = DeepSeekV4StateHostPool(
+                    pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
+                    state_pools=[
+                        kvcache.compress_state_pools[layer_id]
+                        for layer_id in c4_state_global_layers
+                    ],
+                    num_host_pages=swa_num_host_pages,
+                    swa_page_size=kvcache.swa_page_size,
+                    layout=server_args.hicache_mem_layout,
+                    allocator_type=_get_allocator_type(server_args),
+                )
+                c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
+                    pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+                    state_pools=[
+                        kvcache.indexer_compress_state_pools[layer_id]
+                        for layer_id in c4_state_global_layers
+                    ],
+                    num_host_pages=swa_num_host_pages,
+                    swa_page_size=kvcache.swa_page_size,
+                    layout=server_args.hicache_mem_layout,
+                    allocator_type=_get_allocator_type(server_args),
+                )
             entries.extend(
                 [
                     build_pool_entry(
@@ -625,15 +700,22 @@ def build_deepseek_v4_hicache_stack(
         c128_device_buffers, c128_item_bytes = _dsv4_compressed_region_buffers(
             kvcache, 128
         )
-        c128_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C128),
-            device_buffers=c128_device_buffers,
-            item_bytes=c128_item_bytes,
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=_get_allocator_type(server_args),
-        )
+        if gpu_transient:
+            c128_host_pool = make_logical_payload_pool(
+                PoolName.DEEPSEEK_V4_C128,
+                pages=num_host_pages,
+                slot_page_size=page_size,
+            )
+        else:
+            c128_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C128),
+                device_buffers=c128_device_buffers,
+                item_bytes=c128_item_bytes,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
         entries.extend(
@@ -1720,6 +1802,17 @@ def attach_hybrid_pool_to_unified_cache(
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
+        if server_args.hicache_storage_io_mode == "gpu_transient":
+            from sglang.srt.mem_cache.gpu_transient.layout import (
+                build_gpu_payload_layout,
+            )
+
+            if params.mtp_draft_device_pools:
+                raise ValueError(
+                    "GPU-transient HiCache does not yet support MTP draft pools."
+                )
+            # Validate before any strategy can allocate a Host payload pool.
+            build_gpu_payload_layout(kvcache, params.page_size)
         strategy = _select_strategy(kvcache, components)
         result = strategy.build(
             cache=cache,

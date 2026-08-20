@@ -108,7 +108,14 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
+    if (
+        envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
+        or (
+            ctx.enable_hierarchical_cache
+            and server_args.hicache_storage_io_mode == "gpu_transient"
+        )
+        or use_mlx()
+    ):
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa:
